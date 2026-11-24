@@ -1,0 +1,30 @@
+workflow: las_distilbert
+env_file: .env
+args:
+  splits: test
+  limit_per_split: 1
+  task_concurrency: 1
+  run_name: las_smoke
+  output_dir: results
+
+  llm_api: doubao
+  model: doubao-seed-1.6-lite
+  max_tokens: 500000
+  temperature: 0.7
+
+  las_llm_api: doubao
+  las_model: doubao-seed-1.6
+  las_max_tokens: 4096
+  las_temperature: 0.0
+
+  gate_model_name: distilbert-base-uncased
+  gate_checkpoint_path: artifacts/gate/best_model_state.pt
+  gate_max_length: 512
+  weight_distillbert: 0.85
+  weight_local_agreement: 0.07
+  weight_adhere: 0.06
+  weight_history: 0.02
+  gate_threshold: 0.803
+
+  eval_timeout_sec: 60
+  tests_preview_limit: 20

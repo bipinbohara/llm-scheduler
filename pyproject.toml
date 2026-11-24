@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-as-scheduler-mbpp"
+version = "0.1.0"
+description = "MBPP demo implementation for LLM-as-Scheduler."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "datasets>=3.0.0",
+    "jsonschema>=4.0.0",
+    "pandas>=2.0.0",
+    "pydantic>=1.10.0",
+    "PyYAML>=6.0.0",
+    "tqdm>=4.0.0",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40.0"]
+ark = ["volcengine-python-sdk>=5.0.0"]
+gate = ["torch>=2.0.0", "transformers>=4.56,<5"]
+dev = ["pytest>=7.0.0"]
+all = [
+    "anthropic>=0.40.0",
+    "volcengine-python-sdk>=5.0.0",
+    "torch>=2.0.0",
+    "transformers>=4.56,<5",
+    "pytest>=7.0.0",
+]
+
+[project.scripts]
+las-mbpp-baseline = "las_mbpp.cli.run_baseline:main"
+las-mbpp-las = "las_mbpp.cli.run_las:main"
+las-mbpp-run-config = "las_mbpp.cli.run_from_config:main"
+
+[tool.setuptools.packages.find]
+include = ["las_mbpp*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
