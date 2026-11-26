@@ -10,20 +10,22 @@ import sys
 import time
 import traceback
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, TimeoutError, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import pandas as pd
 from datasets import load_dataset
-from tqdm.auto import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from las_mbpp.config import DEFAULT_RESULTS_DIR  # noqa: E402
+from las_mbpp.benchmarks import add_dataset_argument, evaluate_plus_suite, final_benchmark_score, load_tasks, sanitized_mbpp_records
+from las_mbpp.evaluation import run_native_evaluation
+from las_mbpp.local_models import LocalChatClient, get_local_model, positive_int
+from las_mbpp.run_artifacts import RunArtifacts, TracedClient, add_run_arguments, public_url, url_secrets
 from las_mbpp.prompts import (  # noqa: E402
     CODING_SYSTEM_PROMPT,
     CONSENSUS_SYSTEM_PROMPT,
@@ -46,7 +48,6 @@ DEFAULT_TEMPERATURE = 0.7
 ASSERT_CALL_RE = re.compile(r"assert\s+([A-Za-z_]\w*)\s*\(")
 DEF_RE = re.compile(r"(?m)^\s*def\s+([A-Za-z_]\w*)\s*\((.*?)\)\s*:")
 FENCE_RE = re.compile(r"```(?:python|py)?\s*([\s\S]*?)```", re.IGNORECASE)
-SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 def _utc_now_iso() -> str:
@@ -58,12 +59,6 @@ def _safe_json_dumps(obj: Any) -> str:
         return json.dumps(obj, ensure_ascii=False)
     except Exception:
         return json.dumps(str(obj), ensure_ascii=False)
-
-
-def _slugify_name(name: str) -> str:
-    normalized = SAFE_NAME_RE.sub("_", (name or "").strip())
-    normalized = normalized.strip("._-")
-    return normalized or "run"
 
 
 def _estimate_tokens(text: str) -> int:
@@ -150,11 +145,14 @@ def strip_to_code(raw: str, expected_name: Optional[str] = None) -> str:
             code = block
             break
     else:
-        m = re.search(r"(?m)^\s*def\s+[A-Za-z_]\w*\s*\(", text)
-        if m:
-            code = text[m.start() :]
+        try:
+            ast.parse(text)
+        except SyntaxError:
+            m = re.search(r"(?m)^\s*def\s+[A-Za-z_]\w*\s*\(", text)
+            if m:
+                code = text[m.start() :]
     code = code.strip()
-    if expected_name:
+    if expected_name and not re.search(rf"(?m)^def\s+{re.escape(expected_name)}\s*\(", code):
         m_name = re.search(r"(?m)^(\s*def\s+)([A-Za-z_]\w*)(\s*\()", code)
         if m_name:
             got_name = m_name.group(2)
@@ -190,6 +188,8 @@ def _evaluate_code_worker(code: str, setup_code: str, tests: List[str]) -> Dict[
     total_count = len(tests)
 
     try:
+        if not code.strip():
+            raise SyntaxError("Empty candidate.")
         ast.parse(code)
     except SyntaxError as exc:
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
@@ -270,36 +270,34 @@ def _evaluate_code_worker(code: str, setup_code: str, tests: List[str]) -> Dict[
 def evaluate_code(task: Dict[str, Any], raw_completion: str, timeout_sec: float = DEFAULT_EVAL_TIMEOUT) -> Dict[str, Any]:
     expected_name = task.get("function_name")
     code = strip_to_code(raw_completion, expected_name=expected_name)
+    if "evalplus" in task:
+        return evaluate_plus_suite(task, code, "base")
+    tests = task.get("evaluation_tests", task.get("tests", [])) or []
     t0 = time.perf_counter()
-    with ProcessPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(
-            _evaluate_code_worker,
-            code,
-            task.get("setup_code", "") or "",
-            list(task.get("tests", []) or []),
+    try:
+        result = run_native_evaluation(
+            _evaluate_code_worker, code, task.get("setup_code", "") or "", list(tests), timeout_sec,
         )
-        try:
-            result = future.result(timeout=timeout_sec)
-        except TimeoutError:
-            result = {
-                "pass_count": 0,
-                "total_count": len(task.get("tests", []) or []),
-                "passed_all": False,
-                "exec_status": f"Evaluation timeout after {timeout_sec:.1f}s.",
-                "exec_error": "Timeout",
-                "failures": [],
-                "feedback_text": "Evaluation timed out.",
-            }
-        except Exception as exc:  # noqa: BLE001
-            result = {
-                "pass_count": 0,
-                "total_count": len(task.get("tests", []) or []),
-                "passed_all": False,
-                "exec_status": "Evaluation infrastructure error.",
-                "exec_error": str(exc),
-                "failures": [],
-                "feedback_text": f"Evaluation infrastructure error: {exc}",
-            }
+    except TimeoutError:
+        result = {
+            "pass_count": 0,
+            "total_count": len(tests),
+            "passed_all": False,
+            "exec_status": f"Evaluation timeout after {timeout_sec:.1f}s.",
+            "exec_error": "Timeout",
+            "failures": [],
+            "feedback_text": "Evaluation timed out.",
+        }
+    except Exception as exc:  # noqa: BLE001
+        result = {
+            "pass_count": 0,
+            "total_count": len(tests),
+            "passed_all": False,
+            "exec_status": "Evaluation infrastructure error.",
+            "exec_error": str(exc),
+            "failures": [],
+            "feedback_text": f"Evaluation infrastructure error: {exc}",
+        }
     result["code"] = code
     result["eval_latency_sec"] = time.perf_counter() - t0
     return result
@@ -396,6 +394,7 @@ class AnthropicChatClient:
                 "ok": True,
                 "error": "",
                 "output_text": output_text,
+                "finish_reason": getattr(message, "stop_reason", None),
                 "usage": {
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
@@ -420,7 +419,7 @@ class AnthropicChatClient:
 
 
 def _parallel_calls(
-    client: AnthropicChatClient,
+    client: AnthropicChatClient | LocalChatClient | TracedClient,
     requests: Dict[str, Dict[str, str]],
 ) -> Dict[str, Dict[str, Any]]:
     results: Dict[str, Dict[str, Any]] = {}
@@ -546,7 +545,7 @@ def run_pipeline_for_task(
     *,
     run_id: str,
     task: Dict[str, Any],
-    client: AnthropicChatClient,
+    client: AnthropicChatClient | LocalChatClient | TracedClient,
     model: str,
     eval_timeout_sec: float,
     tests_preview_limit: int,
@@ -564,6 +563,7 @@ def run_pipeline_for_task(
             tests=task["tests"],
             agent_name=agent,
             tests_preview_limit=tests_preview_limit,
+            benchmark_name=task.get("benchmark_name", "MBPP"),
         )
         initial_requests[agent] = {
             "system_prompt": CODING_SYSTEM_PROMPT,
@@ -859,7 +859,7 @@ def load_mbpp_sanitized_tasks(
     limit: Optional[int] = None,
     task_ids: Optional[set[int]] = None,
 ) -> List[Dict[str, Any]]:
-    ds = load_dataset("google-research-datasets/mbpp", "sanitized", split=split)
+    ds = sanitized_mbpp_records(split, load_dataset)
     tasks: List[Dict[str, Any]] = []
     for rec in ds:
         task_id = int(rec["task_id"])
@@ -909,11 +909,14 @@ def parse_args() -> argparse.Namespace:
             "verification -> testing -> error correction, and write one CSV per task."
         )
     )
+    add_dataset_argument(ap)
+    add_run_arguments(ap)
     ap.add_argument("--splits", type=str, default="train,test", help="Comma-separated MBPP splits.")
     ap.add_argument("--limit_per_split", type=int, default=None, help="Optional limit per split.")
     ap.add_argument("--task_ids", type=str, default=None, help="Optional comma-separated task_ids filter.")
-    ap.add_argument("--model", type=str, default=DEFAULT_MODEL, help="Model name for Anthropic API.")
-    ap.add_argument("--max_tokens", type=int, default=DEFAULT_MAX_TOKENS, help="max_tokens per model call.")
+    ap.add_argument("--model", type=str, default=DEFAULT_MODEL, help="Model name for the selected backend.")
+    ap.add_argument("--llm_api", choices=["anthropic", "minimax", "local"], default="anthropic")
+    ap.add_argument("--max_tokens", type=positive_int, default=DEFAULT_MAX_TOKENS, help="max_tokens per model call.")
     ap.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE, help="Sampling temperature.")
     ap.add_argument(
         "--eval_timeout_sec",
@@ -942,111 +945,62 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    splits = [s.strip() for s in args.splits.split(",") if s.strip()]
+    splits = list(dict.fromkeys(s.strip() for s in args.splits.split(",") if s.strip()))
     if not splits:
         splits = list(DEFAULT_SPLITS)
     task_ids = _parse_task_ids(args.task_ids)
 
     api_key = args.anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY")
     base_url = args.anthropic_base_url or os.environ.get("ANTHROPIC_BASE_URL")
-    if not api_key:
+    if args.llm_api != "local" and not api_key:
         raise RuntimeError(
             "ANTHROPIC_API_KEY is not set. Export it or pass --anthropic_api_key."
         )
 
-    timestamp_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if args.run_name:
-        run_id = f"{timestamp_tag}_{_slugify_name(args.run_name)}"
+    if args.llm_api == "local":
+        get_local_model(args.model).endpoint()
+        client = LocalChatClient(max_tokens=args.max_tokens, temperature=args.temperature)
     else:
-        run_id = timestamp_tag
-    output_root = Path(args.output_dir).resolve()
-    run_dir = output_root / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    client = AnthropicChatClient(
-        api_key=api_key,
-        base_url=base_url,
-        max_tokens=args.max_tokens,
-        temperature=args.temperature,
-    )
-
-    summary_rows: List[Dict[str, Any]] = []
-    for split in splits:
-        tasks = load_mbpp_sanitized_tasks(
-            split=split,
-            limit=args.limit_per_split,
-            task_ids=task_ids,
+        client = AnthropicChatClient(
+            api_key=api_key,
+            base_url=base_url,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
         )
-        split_dir = run_dir / split
-        split_dir.mkdir(parents=True, exist_ok=True)
 
-        correct_count = 0
-        processed_count = 0
-        pbar = tqdm(tasks, desc=f"LAS_MBPP pipeline ({split})")
-        for task in pbar:
-            task_csv = split_dir / f"task_{task['task_id']}.csv"
-            if task_csv.exists() and not args.overwrite:
+    tasks = [
+        task for split in splits
+        for task in load_tasks(args.dataset, split, limit=args.limit_per_split, task_ids=task_ids,
+                               native_loader=load_mbpp_sanitized_tasks)
+    ]
+    if not tasks:
+        raise ValueError("No tasks matched. Check --splits, --task_ids and --limit_per_split.")
+
+    settings = {
+        "workflow": "baseline", "dataset": args.dataset, "splits": splits,
+        "limit_per_split": args.limit_per_split, "task_ids": sorted(task_ids) if task_ids else None,
+        "llm_api": args.llm_api, "model": args.model, "max_tokens": args.max_tokens,
+        "temperature": args.temperature, "anthropic_base_url": public_url(base_url),
+        "local_base_url": get_local_model(args.model).endpoint() if args.llm_api == "local" else "",
+        "eval_timeout_sec": args.eval_timeout_sec, "tests_preview_limit": args.tests_preview_limit,
+        "excel": args.excel,
+    }
+    secrets = [api_key, *url_secrets(base_url)]
+    if args.llm_api == "local":
+        secrets.append(get_local_model(args.model).key())
+
+    with RunArtifacts(args, settings, tasks, secrets) as run:
+        for task in tasks:
+            if run.completed(task):
                 continue
-
-            rows, final_eval, final_code = run_pipeline_for_task(
-                run_id=run_id,
-                task=task,
-                client=client,
-                model=args.model,
-                eval_timeout_sec=args.eval_timeout_sec,
-                tests_preview_limit=args.tests_preview_limit,
+            traced = TracedClient(client, "workflow")
+            start = time.perf_counter()
+            rows, final_eval, code = run_pipeline_for_task(
+                run_id=run.run_id, task=task, client=traced, model=args.model,
+                eval_timeout_sec=args.eval_timeout_sec, tests_preview_limit=args.tests_preview_limit,
             )
-            pd.DataFrame(rows).to_csv(task_csv, index=False)
-
-            processed_count += 1
-            if final_eval.get("passed_all"):
-                correct_count += 1
-            pass_rate = (correct_count / processed_count) if processed_count else 0.0
-            pbar.set_postfix(pass1=f"{pass_rate:.2%}", processed=processed_count)
-
-            summary_rows.append(
-                {
-                    "run_id": run_id,
-                    "split": split,
-                    "task_id": task["task_id"],
-                    "function_name_from_tests": task["function_name"],
-                    "final_is_correct": bool(final_eval.get("passed_all", False)),
-                    "tests_passed": int(final_eval.get("pass_count", 0) or 0),
-                    "tests_total": int(final_eval.get("total_count", 0) or 0),
-                    "final_exec_status": final_eval.get("exec_status", ""),
-                    "final_code": final_code,
-                    "task_csv": str(task_csv),
-                }
-            )
-
-    summary_path = run_dir / "summary.csv"
-    pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
-
-    config_path = run_dir / "run_config.json"
-    with config_path.open("w", encoding="utf-8") as fh:
-        json.dump(
-            {
-                "run_id": run_id,
-                "timestamp_utc": _utc_now_iso(),
-                "splits": splits,
-                "limit_per_split": args.limit_per_split,
-                "task_ids": sorted(task_ids) if task_ids else None,
-                "model": args.model,
-                "max_tokens": args.max_tokens,
-                "temperature": args.temperature,
-                "eval_timeout_sec": args.eval_timeout_sec,
-                "tests_preview_limit": args.tests_preview_limit,
-                "output_dir": str(run_dir),
-                "anthropic_base_url": base_url or "",
-            },
-            fh,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    print(f"Run completed. Per-task CSV files are in: {run_dir}")
-    print(f"Summary CSV: {summary_path}")
-    print(f"Run config JSON: {config_path}")
+            extra = final_benchmark_score(task, code, final_eval)
+            run.save(task, rows, final_eval, code, traced.calls, time.perf_counter() - start, extra)
 
 
 if __name__ == "__main__":
