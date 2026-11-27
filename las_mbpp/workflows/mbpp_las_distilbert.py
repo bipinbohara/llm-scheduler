@@ -12,21 +12,25 @@ import threading
 import time
 import traceback
 from collections import Counter, defaultdict
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, TimeoutError, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import partial
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
-import pandas as pd
 from datasets import load_dataset
-from tqdm.auto import tqdm
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from las_mbpp.config import DEFAULT_GATE_CHECKPOINT, DEFAULT_RESULTS_DIR  # noqa: E402
+from las_mbpp.checkpoints import checkpoint_identity
+from las_mbpp.benchmarks import add_dataset_argument, evaluate_plus_suite, final_benchmark_score, load_tasks, sanitized_mbpp_records
+from las_mbpp.evaluation import run_native_evaluation
+from las_mbpp.local_models import LocalChatClient, get_local_model, positive_int
+from las_mbpp.run_artifacts import RunArtifacts, TracedClient, add_run_arguments, public_url, url_secrets
 from las_mbpp.prompts import (  # noqa: E402
     CODING_SYSTEM_PROMPT,
     CONSENSUS_SYSTEM_PROMPT,
@@ -70,7 +74,6 @@ LAS_ROUTER_SYSTEM_PROMPT = (
 ASSERT_CALL_RE = re.compile(r"assert\s+([A-Za-z_]\w*)\s*\(")
 DEF_RE = re.compile(r"(?m)^\s*def\s+([A-Za-z_]\w*)\s*\((.*?)\)\s*:")
 FENCE_RE = re.compile(r"```(?:python|py)?\s*([\s\S]*?)```", re.IGNORECASE)
-SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 # Work around broken deepspeed+pydantic combos in some environments.
 # This workflow does not use DeepSpeed; hide it from dependency probes.
@@ -118,16 +121,6 @@ def _safe_json_dumps(obj: Any) -> str:
         return json.dumps(obj, ensure_ascii=False)
     except Exception:
         return json.dumps(str(obj), ensure_ascii=False)
-
-
-def _slugify_name(name: str) -> str:
-    normalized = SAFE_NAME_RE.sub("_", (name or "").strip())
-    normalized = normalized.strip("._-")
-    return normalized or "run"
-
-
-def _print_llm_api_error(backend: str, model: str, error_text: str) -> None:
-    print(f"[LLM API ERROR] backend={backend} model={model} error={error_text}", flush=True)
 
 
 def _estimate_tokens(text: str) -> int:
@@ -406,22 +399,39 @@ class DistilBertPassrateScorer:
         self,
         *,
         model_name: str,
-        checkpoint_path: Path,
+        checkpoint_path: Path | None,
         max_length: int,
+        seed: int = 0,
     ) -> None:
         if torch is None or AutoTokenizer is None or AutoModelForSequenceClassification is None:
             raise RuntimeError(
                 "transformers+torch are required for gate DistilBERT scoring. "
                 f"Import error: {_TRANSFORMERS_IMPORT_ERROR}"
             )
-        if not checkpoint_path.exists():
-            raise FileNotFoundError(f"DistilBERT checkpoint not found: {checkpoint_path}")
-
+        self.checkpoint = checkpoint_identity(checkpoint_path, seed)
         self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self._tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-        self._model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
-        state_dict = torch.load(checkpoint_path, map_location=self._device)
-        self._model.load_state_dict(state_dict)
+        state_dict = None
+        if checkpoint_path is not None:
+            try:
+                state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+            except Exception as exc:
+                raise RuntimeError(f"Cannot read gate checkpoint {checkpoint_path}. Provide the trained DistilBERT state dict.") from exc
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(seed)
+            try:
+                self._tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+                self._model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
+                if checkpoint_path is None:
+                    self._model.pre_classifier.apply(self._model._init_weights)
+                    self._model.classifier.apply(self._model._init_weights)
+            except (OSError, ValueError, ImportError) as exc:
+                raise RuntimeError(f"Cannot initialize {model_name}. Check the gate dependencies and make the model and tokenizer available in the Hugging Face cache.") from exc
+        if checkpoint_path is not None:
+            try:
+                self._model.load_state_dict(state_dict, strict=True)
+            except (RuntimeError, TypeError, ValueError) as exc:
+                raise RuntimeError(f"Gate checkpoint {checkpoint_path} does not match the two-label {model_name} model.") from exc
+            self.checkpoint["load_outcome"] = "strict_load_succeeded"
         self._model.to(self._device)
         self._model.eval()
         self._max_length = int(max_length)
@@ -453,10 +463,13 @@ _GATE_SCORER_CACHE_LOCK = threading.Lock()
 def get_or_create_gate_scorer(
     *,
     model_name: str,
-    checkpoint_path: Path,
+    checkpoint_path: Path | None,
     max_length: int,
+    seed: int = 0,
 ) -> DistilBertPassrateScorer:
-    key = (model_name, str(checkpoint_path.resolve()), int(max_length))
+    identity = checkpoint_identity(checkpoint_path, seed)
+    origin = identity.get("sha256") or f"untrained:{seed}"
+    key = (model_name, origin, int(max_length))
     with _GATE_SCORER_CACHE_LOCK:
         scorer = _GATE_SCORER_CACHE.get(key)
         if scorer is not None:
@@ -465,6 +478,7 @@ def get_or_create_gate_scorer(
             model_name=model_name,
             checkpoint_path=checkpoint_path,
             max_length=max_length,
+            seed=seed,
         )
         _GATE_SCORER_CACHE[key] = scorer
         return scorer
@@ -746,11 +760,14 @@ def strip_to_code(raw: str, expected_name: Optional[str] = None) -> str:
             code = block
             break
     else:
-        m = re.search(r"(?m)^\s*def\s+[A-Za-z_]\w*\s*\(", text)
-        if m:
-            code = text[m.start() :]
+        try:
+            ast.parse(text)
+        except SyntaxError:
+            m = re.search(r"(?m)^\s*def\s+[A-Za-z_]\w*\s*\(", text)
+            if m:
+                code = text[m.start() :]
     code = code.strip()
-    if expected_name:
+    if expected_name and not re.search(rf"(?m)^def\s+{re.escape(expected_name)}\s*\(", code):
         m_name = re.search(r"(?m)^(\s*def\s+)([A-Za-z_]\w*)(\s*\()", code)
         if m_name:
             got_name = m_name.group(2)
@@ -786,6 +803,8 @@ def _evaluate_code_worker(code: str, setup_code: str, tests: List[str]) -> Dict[
     total_count = len(tests)
 
     try:
+        if not code.strip():
+            raise SyntaxError("Empty candidate.")
         ast.parse(code)
     except SyntaxError as exc:
         tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
@@ -866,36 +885,34 @@ def _evaluate_code_worker(code: str, setup_code: str, tests: List[str]) -> Dict[
 def evaluate_code(task: Dict[str, Any], raw_completion: str, timeout_sec: float = DEFAULT_EVAL_TIMEOUT) -> Dict[str, Any]:
     expected_name = task.get("function_name")
     code = strip_to_code(raw_completion, expected_name=expected_name)
+    if "evalplus" in task:
+        return evaluate_plus_suite(task, code, "base")
+    tests = task.get("evaluation_tests", task.get("tests", [])) or []
     t0 = time.perf_counter()
-    with ProcessPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(
-            _evaluate_code_worker,
-            code,
-            task.get("setup_code", "") or "",
-            list(task.get("tests", []) or []),
+    try:
+        result = run_native_evaluation(
+            _evaluate_code_worker, code, task.get("setup_code", "") or "", list(tests), timeout_sec,
         )
-        try:
-            result = future.result(timeout=timeout_sec)
-        except TimeoutError:
-            result = {
-                "pass_count": 0,
-                "total_count": len(task.get("tests", []) or []),
-                "passed_all": False,
-                "exec_status": f"Evaluation timeout after {timeout_sec:.1f}s.",
-                "exec_error": "Timeout",
-                "failures": [],
-                "feedback_text": "Evaluation timed out.",
-            }
-        except Exception as exc:  # noqa: BLE001
-            result = {
-                "pass_count": 0,
-                "total_count": len(task.get("tests", []) or []),
-                "passed_all": False,
-                "exec_status": "Evaluation infrastructure error.",
-                "exec_error": str(exc),
-                "failures": [],
-                "feedback_text": f"Evaluation infrastructure error: {exc}",
-            }
+    except TimeoutError:
+        result = {
+            "pass_count": 0,
+            "total_count": len(tests),
+            "passed_all": False,
+            "exec_status": f"Evaluation timeout after {timeout_sec:.1f}s.",
+            "exec_error": "Timeout",
+            "failures": [],
+            "feedback_text": "Evaluation timed out.",
+        }
+    except Exception as exc:  # noqa: BLE001
+        result = {
+            "pass_count": 0,
+            "total_count": len(tests),
+            "passed_all": False,
+            "exec_status": "Evaluation infrastructure error.",
+            "exec_error": str(exc),
+            "failures": [],
+            "feedback_text": f"Evaluation infrastructure error: {exc}",
+        }
     result["code"] = code
     result["eval_latency_sec"] = time.perf_counter() - t0
     return result
@@ -1017,6 +1034,7 @@ class AnthropicChatClient:
                 "ok": True,
                 "error": "",
                 "output_text": output_text,
+                "finish_reason": getattr(message, "stop_reason", None),
                 "usage": {
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
@@ -1027,7 +1045,6 @@ class AnthropicChatClient:
         except Exception as exc:  # noqa: BLE001
             latency = time.perf_counter() - t0
             error_text = f"{type(exc).__name__}: {exc}"
-            _print_llm_api_error("anthropic", model, error_text)
             input_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt)
             return {
                 "ok": False,
@@ -1147,6 +1164,7 @@ class ArkChatClient:
                 "ok": True,
                 "error": "",
                 "output_text": output_text,
+                "finish_reason": getattr(response, "status", None),
                 "usage": {
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
@@ -1157,7 +1175,6 @@ class ArkChatClient:
         except Exception as exc:  # noqa: BLE001
             latency = time.perf_counter() - t0
             error_text = f"{type(exc).__name__}: {exc}"
-            _print_llm_api_error("ark", model, error_text)
             input_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt)
             return {
                 "ok": False,
@@ -1195,7 +1212,6 @@ def _parallel_calls(
             try:
                 results[agent] = fut.result()
             except Exception as exc:  # noqa: BLE001
-                _print_llm_api_error("worker", req.get("model", ""), f"{type(exc).__name__}: {exc}")
                 est_input = _estimate_tokens(req["system_prompt"]) + _estimate_tokens(req["user_prompt"])
                 results[agent] = {
                     "ok": False,
@@ -1222,6 +1238,8 @@ def create_llm_client(
     ark_base_url: Optional[str],
 ) -> LLMClient:
     backend = (llm_api or DEFAULT_LLM_API).strip().lower()
+    if backend == "local":
+        return LocalChatClient(max_tokens=max_tokens, temperature=temperature)
     if backend in {"minimax", "anthropic"}:
         if not anthropic_api_key:
             raise RuntimeError(
@@ -1570,6 +1588,7 @@ def _append_early_exit_stage(
     rows[-1]["route_action"] = route.action
     rows[-1]["route_target_stage"] = "final_output_unit"
     rows[-1]["route_source_stage"] = route.source_stage
+    rows[-1]["route_source_agent"] = route.source_agent
     rows[-1]["route_applied"] = True
     return stage_index, route.eval_result, route.code
 
@@ -1648,6 +1667,7 @@ def run_pipeline_for_task(
             agent_name=agent,
             tests_preview_limit=tests_preview_limit,
             include_official_test_examples=include_test_examples_in_previous_prompts,
+            benchmark_name=task.get("benchmark_name", "MBPP"),
         )
         llm_res = client.call(
             system_prompt=CODING_SYSTEM_PROMPT,
@@ -2095,7 +2115,7 @@ def load_mbpp_sanitized_tasks(
     limit: Optional[int] = None,
     task_ids: Optional[set[int]] = None,
 ) -> List[Dict[str, Any]]:
-    ds = load_dataset("google-research-datasets/mbpp", "sanitized", split=split)
+    ds = sanitized_mbpp_records(split, load_dataset)
     tasks: List[Dict[str, Any]] = []
     for rec in ds:
         task_id = int(rec["task_id"])
@@ -2142,62 +2162,47 @@ def _run_task_pipeline_job(
     *,
     run_id: str,
     task: Dict[str, Any],
-    llm_api: str,
+    worker_factory: Callable[[], LLMClient],
     model: str,
-    max_tokens: int,
-    temperature: float,
-    anthropic_api_key: Optional[str],
-    anthropic_base_url: Optional[str],
-    ark_api_key: Optional[str],
-    ark_base_url: Optional[str],
-    las_llm_api: str,
+    router_factory: Callable[[], LLMClient],
     las_model: str,
-    las_max_tokens: int,
-    las_temperature: float,
-    las_anthropic_api_key: Optional[str],
-    las_anthropic_base_url: Optional[str],
-    las_ark_api_key: Optional[str],
-    las_ark_base_url: Optional[str],
+    las_llm_api: str,
     gate_scorer: DistilBertPassrateScorer,
     gate_config: GateConfig,
     history_tracker: AgentHistoryTracker,
     eval_timeout_sec: float,
     tests_preview_limit: int,
     include_test_examples_in_previous_prompts: bool,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str]:
-    client = create_llm_client(
-        llm_api=llm_api,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        anthropic_api_key=anthropic_api_key,
-        anthropic_base_url=anthropic_base_url,
-        ark_api_key=ark_api_key,
-        ark_base_url=ark_base_url,
-    )
-    las_client = create_llm_client(
-        llm_api=las_llm_api,
-        max_tokens=las_max_tokens,
-        temperature=las_temperature,
-        anthropic_api_key=las_anthropic_api_key,
-        anthropic_base_url=las_anthropic_base_url,
-        ark_api_key=las_ark_api_key,
-        ark_base_url=las_ark_base_url,
-    )
-    return run_pipeline_for_task(
-        run_id=run_id,
-        task=task,
-        client=client,
-        model=model,
-        las_client=las_client,
-        las_model=las_model,
-        las_llm_api=las_llm_api,
-        gate_scorer=gate_scorer,
-        gate_config=gate_config,
-        history_tracker=history_tracker,
-        eval_timeout_sec=eval_timeout_sec,
-        tests_preview_limit=tests_preview_limit,
-        include_test_examples_in_previous_prompts=include_test_examples_in_previous_prompts,
-    )
+):
+    traced = TracedClient(worker_factory(), "workflow")
+    traced_router = TracedClient(router_factory(), "router")
+    start = time.perf_counter()
+    try:
+        rows, final_eval, code = run_pipeline_for_task(
+            run_id=run_id, task=task, client=traced, model=model, las_client=traced_router,
+            las_model=las_model, las_llm_api=las_llm_api, gate_scorer=gate_scorer,
+            gate_config=gate_config, history_tracker=history_tracker,
+            eval_timeout_sec=eval_timeout_sec, tests_preview_limit=tests_preview_limit,
+            include_test_examples_in_previous_prompts=include_test_examples_in_previous_prompts,
+        )
+        extra = final_benchmark_score(task, code, final_eval)
+    except Exception as exc:  # retain the native runner's per-task failure behavior
+        final_eval = {
+            "pass_count": 0,
+            "total_count": len(task.get("evaluation_tests", task["tests"])),
+            "passed_all": False,
+            "exec_status": "Pipeline execution error.",
+            "exec_error": f"{type(exc).__name__}: {exc}",
+            "failures": [], "feedback_text": "Pipeline execution error.", "eval_latency_sec": 0.0,
+        }
+        rows = [_make_stage_row(
+            run_id=run_id, task=task, stage_index=1, stage_name="pipeline_error",
+            agent_name="pipeline_runner", model_name=model, system_prompt="", input_prompt="",
+            output_text="", output_code="", input_tokens=0, output_tokens=0, total_tokens=0,
+            latency_sec=0.0, api_error=final_eval["exec_error"], eval_result=final_eval,
+        )]
+        code, extra = "", {}
+    return rows, final_eval, code, traced.calls + traced_router.calls, time.perf_counter() - start, extra
 
 
 def parse_args() -> argparse.Namespace:
@@ -2207,6 +2212,8 @@ def parse_args() -> argparse.Namespace:
             "(early_exit/test/refinement) and write one CSV per task."
         )
     )
+    add_dataset_argument(ap)
+    add_run_arguments(ap)
     ap.add_argument("--splits", type=str, default="train,test", help="Comma-separated MBPP splits.")
     ap.add_argument("--limit_per_split", type=int, default=None, help="Optional limit per split.")
     ap.add_argument("--task_ids", type=str, default=None, help="Optional comma-separated task_ids filter.")
@@ -2215,19 +2222,19 @@ def parse_args() -> argparse.Namespace:
         "--llm_api",
         type=str,
         default=DEFAULT_LLM_API,
-        choices=["minimax", "doubao", "anthropic", "ark"],
+        choices=["minimax", "doubao", "anthropic", "ark", "local"],
         help=(
             "LLM API backend: minimax (Anthropic-compatible), doubao (Ark), "
             "or aliases anthropic/ark."
         ),
     )
-    ap.add_argument("--max_tokens", type=int, default=DEFAULT_MAX_TOKENS, help="max_tokens per model call.")
+    ap.add_argument("--max_tokens", type=positive_int, default=DEFAULT_MAX_TOKENS, help="max_tokens per model call.")
     ap.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE, help="Sampling temperature.")
     ap.add_argument(
         "--las_llm_api",
         type=str,
         default=None,
-        choices=["minimax", "doubao", "anthropic", "ark"],
+        choices=["minimax", "doubao", "anthropic", "ark", "local"],
         help="Optional separate LAS router backend. Defaults to --llm_api.",
     )
     ap.add_argument(
@@ -2238,7 +2245,7 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument(
         "--las_max_tokens",
-        type=int,
+        type=positive_int,
         default=None,
         help="Optional LAS max_tokens. Defaults to --max_tokens.",
     )
@@ -2321,7 +2328,10 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_GATE_MODEL_NAME,
         help="Base model name used by DistilBERT gate classifier.",
     )
-    ap.add_argument(
+    gate_source = ap.add_mutually_exclusive_group()
+    gate_source.add_argument("--untrained_gate", action="store_true", help="Use the base model with an untrained two-label head.")
+    ap.add_argument("--gate_seed", type=int, default=0, help="Initialization seed for the untrained gate.")
+    gate_source.add_argument(
         "--gate_checkpoint_path",
         type=Path,
         default=DEFAULT_GATE_CHECKPOINT_PATH,
@@ -2368,7 +2378,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    splits = [s.strip() for s in args.splits.split(",") if s.strip()]
+    splits = list(dict.fromkeys(s.strip() for s in args.splits.split(",") if s.strip()))
     if not splits:
         splits = list(DEFAULT_SPLITS)
     task_ids = _parse_task_ids(args.task_ids)
@@ -2387,6 +2397,11 @@ def main() -> None:
     las_ark_api_key = args.las_ark_api_key or ark_api_key
     las_ark_base_url = args.las_ark_base_url or os.environ.get("LAS_ARK_BASE_URL") or ark_base_url
 
+    if args.llm_api == "local":
+        get_local_model(args.model).endpoint()
+    if las_llm_api == "local":
+        get_local_model(las_model).endpoint()
+
     gate_config = GateConfig(
         weight_distillbert=float(args.weight_distillbert),
         weight_local_agreement=float(args.weight_local_agreement),
@@ -2395,16 +2410,8 @@ def main() -> None:
         threshold=float(args.gate_threshold),
     )
 
-    timestamp_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-    if args.run_name:
-        run_id = f"{timestamp_tag}_{_slugify_name(args.run_name)}"
-    else:
-        run_id = timestamp_tag
-    output_root = Path(args.output_dir).resolve()
-    run_dir = output_root / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    _ = create_llm_client(
+    worker_factory = partial(
+        create_llm_client,
         llm_api=args.llm_api,
         max_tokens=args.max_tokens,
         temperature=args.temperature,
@@ -2413,7 +2420,8 @@ def main() -> None:
         ark_api_key=ark_api_key,
         ark_base_url=ark_base_url,
     )
-    _ = create_llm_client(
+    router_factory = partial(
+        create_llm_client,
         llm_api=las_llm_api,
         max_tokens=las_max_tokens,
         temperature=las_temperature,
@@ -2422,187 +2430,75 @@ def main() -> None:
         ark_api_key=las_ark_api_key,
         ark_base_url=las_ark_base_url,
     )
+    worker_factory()
+    router_factory()
     gate_scorer = get_or_create_gate_scorer(
         model_name=args.gate_model_name,
-        checkpoint_path=Path(args.gate_checkpoint_path),
+        checkpoint_path=None if args.untrained_gate else args.gate_checkpoint_path,
         max_length=args.gate_max_length,
+        seed=args.gate_seed,
     )
+    tasks_by_split = [
+        load_tasks(args.dataset, split, limit=args.limit_per_split, task_ids=task_ids,
+                   native_loader=load_mbpp_sanitized_tasks)
+        for split in splits
+    ]
+    tasks = [task for split_tasks in tasks_by_split for task in split_tasks]
+    if not tasks:
+        raise ValueError("No tasks matched. Check --splits, --task_ids and --limit_per_split.")
+
+    checkpoint = dict(gate_scorer.checkpoint)
+    if not args.untrained_gate:
+        checkpoint["path"] = str(args.gate_checkpoint_path.resolve())
+    settings = {
+        "workflow": "las_distilbert", "dataset": args.dataset, "splits": splits,
+        "limit_per_split": args.limit_per_split, "task_ids": sorted(task_ids) if task_ids else None,
+        "model": args.model, "llm_api": args.llm_api, "max_tokens": args.max_tokens,
+        "temperature": args.temperature, "las_llm_api": las_llm_api, "las_model": las_model,
+        "las_max_tokens": las_max_tokens, "las_temperature": las_temperature,
+        "task_concurrency": args.task_concurrency, "eval_timeout_sec": args.eval_timeout_sec,
+        "include_test_examples_in_previous_prompts": args.include_test_examples_in_previous_prompts,
+        "tests_preview_limit": args.tests_preview_limit, "checkpoint": checkpoint,
+        "gate_checkpoint_path": checkpoint.get("path"),
+        "gate_model_name": args.gate_model_name, "gate_max_length": args.gate_max_length,
+        "weight_distillbert": gate_config.weight_distillbert,
+        "weight_local_agreement": gate_config.weight_local_agreement,
+        "weight_adhere": gate_config.weight_adhere, "weight_history": gate_config.weight_history,
+        "gate_threshold": gate_config.threshold, "excel": args.excel,
+        "anthropic_base_url": public_url(anthropic_base_url), "ark_base_url": public_url(ark_base_url),
+        "las_anthropic_base_url": public_url(las_anthropic_base_url),
+        "las_ark_base_url": public_url(las_ark_base_url),
+        "local_base_url": get_local_model(args.model).endpoint() if args.llm_api == "local" else "",
+        "las_local_base_url": get_local_model(las_model).endpoint() if las_llm_api == "local" else "",
+    }
+    secrets = [anthropic_api_key, ark_api_key, las_anthropic_api_key, las_ark_api_key]
+    secrets.extend(url_secrets(anthropic_base_url, ark_base_url, las_anthropic_base_url, las_ark_base_url))
+    if args.llm_api == "local":
+        secrets.append(get_local_model(args.model).key())
+    if las_llm_api == "local":
+        secrets.append(get_local_model(las_model).key())
+
     history_tracker = AgentHistoryTracker()
-
-    summary_rows: List[Dict[str, Any]] = []
-    for split in splits:
-        tasks = load_mbpp_sanitized_tasks(
-            split=split,
-            limit=args.limit_per_split,
-            task_ids=task_ids,
-        )
-        split_dir = run_dir / split
-        split_dir.mkdir(parents=True, exist_ok=True)
-
-        tasks_to_run: List[Tuple[Dict[str, Any], Path]] = []
-        for task in tasks:
-            task_csv = split_dir / f"task_{task['task_id']}.csv"
-            if task_csv.exists() and not args.overwrite:
-                continue
-            tasks_to_run.append((task, task_csv))
-
-        if not tasks_to_run:
-            continue
-
-        correct_count = 0
-        processed_count = 0
-        pbar = tqdm(total=len(tasks_to_run), desc=f"LAS_MBPP pipeline ({split})")
-        max_workers = max(1, int(args.task_concurrency))
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            future_map = {}
-            for task, task_csv in tasks_to_run:
-                fut = pool.submit(
-                    _run_task_pipeline_job,
-                    run_id=run_id,
-                    task=task,
-                    llm_api=args.llm_api,
-                    model=args.model,
-                    max_tokens=args.max_tokens,
-                    temperature=args.temperature,
-                    anthropic_api_key=anthropic_api_key,
-                    anthropic_base_url=anthropic_base_url,
-                    ark_api_key=ark_api_key,
-                    ark_base_url=ark_base_url,
-                    las_llm_api=las_llm_api,
-                    las_model=las_model,
-                    las_max_tokens=las_max_tokens,
-                    las_temperature=las_temperature,
-                    las_anthropic_api_key=las_anthropic_api_key,
-                    las_anthropic_base_url=las_anthropic_base_url,
-                    las_ark_api_key=las_ark_api_key,
-                    las_ark_base_url=las_ark_base_url,
-                    gate_scorer=gate_scorer,
-                    gate_config=gate_config,
-                    history_tracker=history_tracker,
-                    eval_timeout_sec=args.eval_timeout_sec,
-                    tests_preview_limit=args.tests_preview_limit,
-                    include_test_examples_in_previous_prompts=args.include_test_examples_in_previous_prompts,
-                )
-                future_map[fut] = (task, task_csv)
-
-            for fut in as_completed(future_map):
-                task, task_csv = future_map[fut]
-                try:
-                    rows, final_eval, final_code = fut.result()
-                except Exception as exc:  # noqa: BLE001
-                    err_text = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-                    print(
-                        f"[TASK ERROR] split={split} task_id={task['task_id']} error={type(exc).__name__}: {exc}",
-                        flush=True,
-                    )
-                    _print_llm_api_error(args.llm_api, args.model, err_text.strip())
-                    failure_eval = {
-                        "pass_count": 0,
-                        "total_count": len(task.get("tests", []) or []),
-                        "passed_all": False,
-                        "exec_status": "Pipeline execution error.",
-                        "exec_error": str(exc),
-                        "failures": [],
-                        "feedback_text": "Pipeline execution error.",
-                        "eval_latency_sec": 0.0,
-                    }
-                    rows = [
-                        _make_stage_row(
-                            run_id=run_id,
-                            task=task,
-                            stage_index=1,
-                            stage_name="pipeline_error",
-                            agent_name="pipeline_runner",
-                            model_name=args.model,
-                            system_prompt="",
-                            input_prompt="",
-                            output_text="",
-                            output_code="",
-                            input_tokens=0,
-                            output_tokens=0,
-                            total_tokens=0,
-                            latency_sec=0.0,
-                            api_error=err_text.strip(),
-                            eval_result=failure_eval,
-                        )
-                    ]
-                    final_eval = failure_eval
-                    final_code = ""
-
-                pd.DataFrame(rows).to_csv(task_csv, index=False)
-                processed_count += 1
-                final_route_action = ""
-                if rows:
-                    final_route_action = safe_text(rows[-1].get("route_action")).strip()
-                if final_eval.get("passed_all"):
-                    correct_count += 1
-                pass_rate = (correct_count / processed_count) if processed_count else 0.0
-                pbar.set_postfix(pass1=f"{pass_rate:.2%}", processed=processed_count)
-                pbar.update(1)
-
-                summary_rows.append(
-                    {
-                        "run_id": run_id,
-                        "split": split,
-                        "task_id": task["task_id"],
-                        "function_name_from_tests": task["function_name"],
-                        "final_is_correct": bool(final_eval.get("passed_all", False)),
-                        "tests_passed": int(final_eval.get("pass_count", 0) or 0),
-                        "tests_total": int(final_eval.get("total_count", 0) or 0),
-                        "final_exec_status": final_eval.get("exec_status", ""),
-                        "final_code": final_code,
-                        "final_route_action": final_route_action,
-                        "task_csv": str(task_csv),
-                    }
-                )
-        pbar.close()
-
-    summary_path = run_dir / "summary.csv"
-    pd.DataFrame(summary_rows).to_csv(summary_path, index=False)
-
-    config_path = run_dir / "run_config.json"
-    with config_path.open("w", encoding="utf-8") as fh:
-        json.dump(
-            {
-                "run_id": run_id,
-                "timestamp_utc": _utc_now_iso(),
-                "splits": splits,
-                "limit_per_split": args.limit_per_split,
-                "task_ids": sorted(task_ids) if task_ids else None,
-                "model": args.model,
-                "llm_api": args.llm_api,
-                "max_tokens": args.max_tokens,
-                "temperature": args.temperature,
-                "las_llm_api": las_llm_api,
-                "las_model": las_model,
-                "las_max_tokens": las_max_tokens,
-                "las_temperature": las_temperature,
-                "task_concurrency": args.task_concurrency,
-                "include_test_examples_in_previous_prompts": args.include_test_examples_in_previous_prompts,
-                "eval_timeout_sec": args.eval_timeout_sec,
-                "tests_preview_limit": args.tests_preview_limit,
-                "gate_model_name": args.gate_model_name,
-                "gate_checkpoint_path": str(Path(args.gate_checkpoint_path).resolve()),
-                "gate_max_length": args.gate_max_length,
-                "weight_distillbert": gate_config.weight_distillbert,
-                "weight_local_agreement": gate_config.weight_local_agreement,
-                "weight_adhere": gate_config.weight_adhere,
-                "weight_history": gate_config.weight_history,
-                "gate_threshold": gate_config.threshold,
-                "output_dir": str(run_dir),
-                "anthropic_base_url": anthropic_base_url or "",
-                "ark_base_url": ark_base_url or "",
-                "las_anthropic_base_url": las_anthropic_base_url or "",
-                "las_ark_base_url": las_ark_base_url or "",
-            },
-            fh,
-            ensure_ascii=False,
-            indent=2,
-        )
-
-    print(f"Run completed. Per-task CSV files are in: {run_dir}")
-    print(f"Summary CSV: {summary_path}")
-    print(f"Run config JSON: {config_path}")
+    with RunArtifacts(args, settings, tasks, secrets) as run:
+        for record in run.records.values():
+            for row in record["stages"]:
+                if row.get("gate_decision"):
+                    history_tracker.update(row["agent_name"], row["is_correct"])
+        for split_tasks in tasks_by_split:
+            with ThreadPoolExecutor(max_workers=max(1, args.task_concurrency)) as pool:
+                future_map = {
+                    pool.submit(
+                        _run_task_pipeline_job,
+                        run_id=run.run_id, task=task, worker_factory=worker_factory, model=args.model,
+                        router_factory=router_factory, las_model=las_model, las_llm_api=las_llm_api,
+                        gate_scorer=gate_scorer, gate_config=gate_config, history_tracker=history_tracker,
+                        eval_timeout_sec=args.eval_timeout_sec, tests_preview_limit=args.tests_preview_limit,
+                        include_test_examples_in_previous_prompts=args.include_test_examples_in_previous_prompts,
+                    ): task for task in split_tasks if not run.completed(task)
+                }
+                for future in as_completed(future_map):
+                    rows, final_eval, code, calls, elapsed, extra = future.result()
+                    run.save(future_map[future], rows, final_eval, code, calls, elapsed, extra)
 
 
 if __name__ == "__main__":

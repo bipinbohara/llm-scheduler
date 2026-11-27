@@ -35,6 +35,7 @@ def build_debate_initial_prompt(
     agent_name: str,
     tests_preview_limit: int = 5,
     include_official_test_examples: bool = True,
+    benchmark_name: str = "MBPP",
 ) -> str:
     tests_block = ""
     if include_official_test_examples:
@@ -42,7 +43,7 @@ def build_debate_initial_prompt(
         tests_block = "Official test examples:\n" f"{tests_text}\n\n"
     return (
         f"You are Debate Agent {agent_name}.\n"
-        "Write a correct implementation for the MBPP task.\n"
+        f"Write a correct implementation for the {benchmark_name} task.\n"
         f"Required function name from official tests: {function_name_from_tests}\n\n"
         f"Problem:\n{task_description}\n\n"
         f"Function stub:\n{function_stub}\n\n"

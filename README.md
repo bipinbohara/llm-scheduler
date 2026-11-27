@@ -38,7 +38,7 @@ cp .env.example .env
 
 Fill `.env` with the API keys for the backend you use. The paper-aligned LAS config uses Doubao through Volcano Ark, so it needs `ARK_API_KEY`.
 
-The DistilBERT gate checkpoint is not committed. Place it at:
+The checkout contains a Git LFS pointer for the trained gate. Place the full checkpoint payload at:
 
 ```text
 artifacts/gate/best_model_state.pt
@@ -67,7 +67,9 @@ las-mbpp-las --splits test --limit_per_split 1 --gate_checkpoint_path artifacts/
 las-mbpp-baseline --splits test --limit_per_split 1
 ```
 
-Outputs are written under `results/<run_id>/` with one CSV per task, `summary.csv`, and `run_config.json`.
+Outputs are written under `results/<dataset>/<run_id>/`. Each completed task has a JSON record and stage CSV. Use `--resume <run_id>` with the original settings to continue a saved run and `--excel` to export the summary workbook.
+
+See [architecture and command inventory](docs/architecture.md) for local inference, official dataset preparation, paired gate runs, and resume. See [result fields](docs/results.md) for metric definitions.
 
 ## Notes
 

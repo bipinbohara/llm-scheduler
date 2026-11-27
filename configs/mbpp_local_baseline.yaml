@@ -1,0 +1,10 @@
+workflow: baseline
+env_file: .env
+args:
+  dataset: mbpp
+  splits: test
+  limit_per_split: 1
+  llm_api: local
+  model: openai/gpt-oss-20b
+  max_tokens: 4096
+  temperature: 0.7
