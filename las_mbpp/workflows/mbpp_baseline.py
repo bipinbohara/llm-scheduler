@@ -25,6 +25,7 @@ from las_mbpp.config import DEFAULT_RESULTS_DIR  # noqa: E402
 from las_mbpp.benchmarks import add_dataset_argument, evaluate_plus_suite, final_benchmark_score, load_tasks, sanitized_mbpp_records
 from las_mbpp.evaluation import run_native_evaluation
 from las_mbpp.local_models import LocalChatClient, get_local_model, positive_int
+from las_mbpp.telemetry import HTTP_HOOKS, event, model_node, observe, span, submit
 from las_mbpp.run_artifacts import RunArtifacts, TracedClient, add_run_arguments, public_url, url_secrets
 from las_mbpp.prompts import (  # noqa: E402
     CODING_SYSTEM_PROMPT,
@@ -136,6 +137,7 @@ def build_prompt_stub(description: str, reference_code: str, function_name: str)
     return f'{sig_line}\n    """{desc}"""\n    pass\n'
 
 
+@observe("grader.extract_code", "processing")
 def strip_to_code(raw: str, expected_name: Optional[str] = None) -> str:
     text = (raw or "").strip()
     code = text
@@ -267,7 +269,11 @@ def _evaluate_code_worker(code: str, setup_code: str, tests: List[str]) -> Dict[
     }
 
 
-def evaluate_code(task: Dict[str, Any], raw_completion: str, timeout_sec: float = DEFAULT_EVAL_TIMEOUT) -> Dict[str, Any]:
+@observe("grader.evaluate_candidate", "grading")
+def evaluate_code(
+    task: Dict[str, Any], raw_completion: str, timeout_sec: float = DEFAULT_EVAL_TIMEOUT,
+    *, source_call_id: str | None = None, stage: str | None = None,
+) -> Dict[str, Any]:
     expected_name = task.get("function_name")
     code = strip_to_code(raw_completion, expected_name=expected_name)
     if "evalplus" in task:
@@ -301,6 +307,11 @@ def evaluate_code(task: Dict[str, Any], raw_completion: str, timeout_sec: float 
     result["code"] = code
     result["eval_latency_sec"] = time.perf_counter() - t0
     return result
+
+
+@observe("testing", "node", agent="testing_stage")
+def evaluate_test_node(*args, **kwargs):
+    return evaluate_code(*args, **kwargs)
 
 
 def build_test_feedback(eval_result: Dict[str, Any], max_failures: int = 5) -> str:
@@ -349,7 +360,7 @@ class AnthropicChatClient:
             kwargs["api_key"] = api_key
         if base_url:
             kwargs["base_url"] = base_url
-        self.client = anthropic.Anthropic(**kwargs)
+        self.client = anthropic.Anthropic(http_client=anthropic.DefaultHttpxClient(event_hooks=HTTP_HOOKS), **kwargs)
         self.max_tokens = int(max_tokens)
         self.temperature = float(temperature)
 
@@ -359,7 +370,7 @@ class AnthropicChatClient:
             message = self.client.messages.create(
                 model=model,
                 max_tokens=self.max_tokens,
-                temperature=self.temperature,
+                extra_body={"temperature": self.temperature},
                 system=system_prompt,
                 messages=[
                     {
@@ -385,6 +396,10 @@ class AnthropicChatClient:
                 else:
                     input_tokens = int(getattr(usage_obj, "input_tokens", 0) or 0)
                     output_tokens = int(getattr(usage_obj, "output_tokens", 0) or 0)
+            provider_usage = None
+            if usage_obj is not None:
+                provider_usage = {"input_tokens": input_tokens, "output_tokens": output_tokens,
+                                  "total_tokens": input_tokens + output_tokens}
             if input_tokens == 0:
                 input_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt)
             if output_tokens == 0:
@@ -395,6 +410,8 @@ class AnthropicChatClient:
                 "error": "",
                 "output_text": output_text,
                 "finish_reason": getattr(message, "stop_reason", None),
+                "provider_usage": provider_usage, "response_id": getattr(message, "id", None),
+                "reported_model": getattr(message, "model", None),
                 "usage": {
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
@@ -421,14 +438,15 @@ class AnthropicChatClient:
 def _parallel_calls(
     client: AnthropicChatClient | LocalChatClient | TracedClient,
     requests: Dict[str, Dict[str, str]],
+    stage: str,
 ) -> Dict[str, Dict[str, Any]]:
     results: Dict[str, Dict[str, Any]] = {}
     if not requests:
         return results
     with ThreadPoolExecutor(max_workers=len(requests)) as pool:
         future_to_agent = {
-            pool.submit(
-                client.call,
+            submit(
+                pool, model_node, client, stage, f"debate_agent_{agent}",
                 system_prompt=req["system_prompt"],
                 user_prompt=req["user_prompt"],
                 model=req["model"],
@@ -456,6 +474,7 @@ def _parallel_calls(
     return results
 
 
+@observe("graph.select_consensus", "processing")
 def _parse_consensus_choice(raw_text: str, valid_agents: List[str]) -> Tuple[Optional[str], str]:
     data = _extract_json_dict(raw_text)
     reason = ""
@@ -506,9 +525,13 @@ def _make_stage_row(
     latency_sec: float,
     api_error: str,
     eval_result: Dict[str, Any],
+    workflow_call_id: str | None = None,
     selected_agent: str = "",
     selected_reason: str = "",
 ) -> Dict[str, Any]:
+    event("stage_result", stage_index=stage_index, stage=stage_name, agent=agent_name, call_id=workflow_call_id,
+          status=eval_result.get("exec_status"), passed=eval_result.get("passed_all"),
+          error=api_error or eval_result.get("exec_error"))
     return {
         "run_id": run_id,
         "timestamp_utc": _utc_now_iso(),
@@ -518,6 +541,7 @@ def _make_stage_row(
         "stage_index": stage_index,
         "stage_name": stage_name,
         "agent_name": agent_name,
+        "workflow_call_id": workflow_call_id,
         "model": model_name,
         "system_prompt": system_prompt,
         "agent_input": input_prompt,
@@ -541,6 +565,7 @@ def _make_stage_row(
     }
 
 
+@observe("graph.execute", "graph")
 def run_pipeline_for_task(
     *,
     run_id: str,
@@ -571,11 +596,13 @@ def run_pipeline_for_task(
             "model": model,
         }
 
-    initial_results = _parallel_calls(client, initial_requests)
+    event("round", round_index=1, agents=[f"debate_agent_{agent}" for agent in debate_agents], edges=[])
+    initial_results = _parallel_calls(client, initial_requests, "debate_initial")
     initial_outputs: Dict[str, Dict[str, Any]] = {}
     for agent in debate_agents:
         llm_res = initial_results[agent]
-        eval_res = evaluate_code(task, llm_res["output_text"], timeout_sec=eval_timeout_sec)
+        eval_res = evaluate_code(task, llm_res["output_text"], timeout_sec=eval_timeout_sec,
+                                 source_call_id=llm_res.get("_trace_call_id"), stage="debate")
         initial_outputs[agent] = {
             "code": eval_res["code"],
             "eval": eval_res,
@@ -594,6 +621,7 @@ def run_pipeline_for_task(
                 system_prompt=CODING_SYSTEM_PROMPT,
                 input_prompt=initial_requests[agent]["user_prompt"],
                 output_text=llm_res["output_text"],
+                workflow_call_id=llm_res.get("_trace_call_id"),
                 output_code=eval_res["code"],
                 input_tokens=llm_res["usage"]["input_tokens"],
                 output_tokens=llm_res["usage"]["output_tokens"],
@@ -623,11 +651,15 @@ def run_pipeline_for_task(
             "model": model,
         }
 
-    final_debate_results = _parallel_calls(client, final_debate_requests)
+    event("round", round_index=2, agents=[f"debate_agent_{agent}" for agent in debate_agents],
+          edges=[{"from": f"debate_agent_{peer}", "to": f"debate_agent_{agent}", "from_round": 1, "to_round": 2}
+                 for agent in debate_agents for peer in debate_agents])
+    final_debate_results = _parallel_calls(client, final_debate_requests, "debate_final")
     final_outputs: Dict[str, Dict[str, Any]] = {}
     for agent in debate_agents:
         llm_res = final_debate_results[agent]
-        eval_res = evaluate_code(task, llm_res["output_text"], timeout_sec=eval_timeout_sec)
+        eval_res = evaluate_code(task, llm_res["output_text"], timeout_sec=eval_timeout_sec,
+                                 source_call_id=llm_res.get("_trace_call_id"), stage="debate")
         final_outputs[agent] = {
             "code": eval_res["code"],
             "eval": eval_res,
@@ -646,6 +678,7 @@ def run_pipeline_for_task(
                 system_prompt=CODING_SYSTEM_PROMPT,
                 input_prompt=final_debate_requests[agent]["user_prompt"],
                 output_text=llm_res["output_text"],
+                workflow_call_id=llm_res.get("_trace_call_id"),
                 output_code=eval_res["code"],
                 input_tokens=llm_res["usage"]["input_tokens"],
                 output_tokens=llm_res["usage"]["output_tokens"],
@@ -665,7 +698,8 @@ def run_pipeline_for_task(
         candidate_codes=candidate_codes,
         tests_preview_limit=tests_preview_limit,
     )
-    consensus_res = client.call(
+    consensus_res = model_node(
+        client, "consensus", "consensus_agent",
         system_prompt=CONSENSUS_SYSTEM_PROMPT,
         user_prompt=consensus_prompt,
         model=model,
@@ -685,6 +719,9 @@ def run_pipeline_for_task(
 
     selected_code = final_outputs[selected_agent]["code"]
     selected_eval = final_outputs[selected_agent]["eval"]
+    event("reuse_validated_answer", stage="consensus", source_agent=f"debate_agent_{selected_agent}",
+          source_call_id=final_outputs[selected_agent]["llm"].get("_trace_call_id"),
+          tests_passed=selected_eval["pass_count"], tests_total=selected_eval["total_count"])
     stage_index += 1
     rows.append(
         _make_stage_row(
@@ -697,6 +734,7 @@ def run_pipeline_for_task(
             system_prompt=CONSENSUS_SYSTEM_PROMPT,
             input_prompt=consensus_prompt,
             output_text=consensus_res["output_text"],
+            workflow_call_id=consensus_res.get("_trace_call_id"),
             output_code=selected_code,
             input_tokens=consensus_res["usage"]["input_tokens"],
             output_tokens=consensus_res["usage"]["output_tokens"],
@@ -715,12 +753,14 @@ def run_pipeline_for_task(
         function_name_from_tests=task["function_name"],
         selected_code=selected_code,
     )
-    reflection_res = client.call(
+    reflection_res = model_node(
+        client, "reflection", "reflection_agent",
         system_prompt=CODING_SYSTEM_PROMPT,
         user_prompt=reflection_prompt,
         model=model,
     )
-    reflection_eval = evaluate_code(task, reflection_res["output_text"], timeout_sec=eval_timeout_sec)
+    reflection_eval = evaluate_code(task, reflection_res["output_text"], timeout_sec=eval_timeout_sec,
+                                 source_call_id=reflection_res.get("_trace_call_id"), stage="reflection")
     reflected_code = reflection_eval["code"]
     stage_index += 1
     rows.append(
@@ -734,6 +774,7 @@ def run_pipeline_for_task(
             system_prompt=CODING_SYSTEM_PROMPT,
             input_prompt=reflection_prompt,
             output_text=reflection_res["output_text"],
+            workflow_call_id=reflection_res.get("_trace_call_id"),
             output_code=reflected_code,
             input_tokens=reflection_res["usage"]["input_tokens"],
             output_tokens=reflection_res["usage"]["output_tokens"],
@@ -752,12 +793,14 @@ def run_pipeline_for_task(
         tests=task["tests"],
         tests_preview_limit=tests_preview_limit,
     )
-    verification_res = client.call(
+    verification_res = model_node(
+        client, "verification", "verification_agent",
         system_prompt=CODING_SYSTEM_PROMPT,
         user_prompt=verification_prompt,
         model=model,
     )
-    verification_eval = evaluate_code(task, verification_res["output_text"], timeout_sec=eval_timeout_sec)
+    verification_eval = evaluate_code(task, verification_res["output_text"], timeout_sec=eval_timeout_sec,
+                                 source_call_id=verification_res.get("_trace_call_id"), stage="verification")
     verified_code = verification_eval["code"]
     stage_index += 1
     rows.append(
@@ -771,6 +814,7 @@ def run_pipeline_for_task(
             system_prompt=CODING_SYSTEM_PROMPT,
             input_prompt=verification_prompt,
             output_text=verification_res["output_text"],
+            workflow_call_id=verification_res.get("_trace_call_id"),
             output_code=verified_code,
             input_tokens=verification_res["usage"]["input_tokens"],
             output_tokens=verification_res["usage"]["output_tokens"],
@@ -781,7 +825,8 @@ def run_pipeline_for_task(
         )
     )
 
-    testing_eval = evaluate_code(task, verified_code, timeout_sec=eval_timeout_sec)
+    testing_eval = evaluate_test_node(task, verified_code, timeout_sec=eval_timeout_sec,
+                                      source_call_id=verification_res.get("_trace_call_id"))
     testing_output = _safe_json_dumps(
         {
             "exec_status": testing_eval.get("exec_status", ""),
@@ -821,12 +866,14 @@ def run_pipeline_for_task(
         tests=task["tests"],
         tests_preview_limit=tests_preview_limit,
     )
-    correction_res = client.call(
+    correction_res = model_node(
+        client, "error_correction", "error_correction_agent",
         system_prompt=CODING_SYSTEM_PROMPT,
         user_prompt=correction_prompt,
         model=model,
     )
-    correction_eval = evaluate_code(task, correction_res["output_text"], timeout_sec=eval_timeout_sec)
+    correction_eval = evaluate_code(task, correction_res["output_text"], timeout_sec=eval_timeout_sec,
+                                 source_call_id=correction_res.get("_trace_call_id"), stage="error_correction")
     final_code = correction_eval["code"]
     stage_index += 1
     rows.append(
@@ -840,6 +887,7 @@ def run_pipeline_for_task(
             system_prompt=CODING_SYSTEM_PROMPT,
             input_prompt=correction_prompt,
             output_text=correction_res["output_text"],
+            workflow_call_id=correction_res.get("_trace_call_id"),
             output_code=final_code,
             input_tokens=correction_res["usage"]["input_tokens"],
             output_tokens=correction_res["usage"]["output_tokens"],
@@ -952,55 +1000,59 @@ def main() -> None:
 
     api_key = args.anthropic_api_key or os.environ.get("ANTHROPIC_API_KEY")
     base_url = args.anthropic_base_url or os.environ.get("ANTHROPIC_BASE_URL")
-    if args.llm_api != "local" and not api_key:
-        raise RuntimeError(
-            "ANTHROPIC_API_KEY is not set. Export it or pass --anthropic_api_key."
-        )
-
-    if args.llm_api == "local":
-        get_local_model(args.model).endpoint()
-        client = LocalChatClient(max_tokens=args.max_tokens, temperature=args.temperature)
-    else:
-        client = AnthropicChatClient(
-            api_key=api_key,
-            base_url=base_url,
-            max_tokens=args.max_tokens,
-            temperature=args.temperature,
-        )
-
-    tasks = [
-        task for split in splits
-        for task in load_tasks(args.dataset, split, limit=args.limit_per_split, task_ids=task_ids,
-                               native_loader=load_mbpp_sanitized_tasks)
-    ]
-    if not tasks:
-        raise ValueError("No tasks matched. Check --splits, --task_ids and --limit_per_split.")
-
-    settings = {
-        "workflow": "baseline", "dataset": args.dataset, "splits": splits,
-        "limit_per_split": args.limit_per_split, "task_ids": sorted(task_ids) if task_ids else None,
-        "llm_api": args.llm_api, "model": args.model, "max_tokens": args.max_tokens,
-        "temperature": args.temperature, "anthropic_base_url": public_url(base_url),
-        "local_base_url": get_local_model(args.model).endpoint() if args.llm_api == "local" else "",
-        "eval_timeout_sec": args.eval_timeout_sec, "tests_preview_limit": args.tests_preview_limit,
-        "excel": args.excel,
-    }
     secrets = [api_key, *url_secrets(base_url)]
     if args.llm_api == "local":
         secrets.append(get_local_model(args.model).key())
 
-    with RunArtifacts(args, settings, tasks, secrets) as run:
+    with RunArtifacts(args, secrets) as run:
+        run.log("Initializing generation provider")
+        if args.llm_api != "local" and not api_key:
+            raise RuntimeError(
+                "ANTHROPIC_API_KEY is not set. Export it or pass --anthropic_api_key."
+            )
+
+        if args.llm_api == "local":
+            get_local_model(args.model).endpoint()
+            client = LocalChatClient(max_tokens=args.max_tokens, temperature=args.temperature)
+        else:
+            client = AnthropicChatClient(
+                api_key=api_key,
+                base_url=base_url,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+            )
+
+        run.log("Loading evaluation dataset")
+        tasks = [
+            task for split in splits
+            for task in load_tasks(args.dataset, split, limit=args.limit_per_split, task_ids=task_ids,
+                                   native_loader=load_mbpp_sanitized_tasks)
+        ]
+        if not tasks:
+            raise ValueError("No tasks matched. Check --splits, --task_ids and --limit_per_split.")
+
+        settings = {
+            "workflow": "baseline", "dataset": args.dataset, "splits": splits,
+            "limit_per_split": args.limit_per_split, "task_ids": sorted(task_ids) if task_ids else None,
+            "llm_api": args.llm_api, "model": args.model, "max_tokens": args.max_tokens,
+            "temperature": args.temperature, "anthropic_base_url": public_url(base_url),
+            "local_base_url": get_local_model(args.model).endpoint() if args.llm_api == "local" else "",
+            "eval_timeout_sec": args.eval_timeout_sec, "tests_preview_limit": args.tests_preview_limit,
+            "excel": args.excel,
+        }
+        run.configure(settings, tasks)
         for task in tasks:
             if run.completed(task):
                 continue
-            traced = TracedClient(client, "workflow")
-            start = time.perf_counter()
-            rows, final_eval, code = run_pipeline_for_task(
-                run_id=run.run_id, task=task, client=traced, model=args.model,
-                eval_timeout_sec=args.eval_timeout_sec, tests_preview_limit=args.tests_preview_limit,
-            )
-            extra = final_benchmark_score(task, code, final_eval)
-            run.save(task, rows, final_eval, code, traced.calls, time.perf_counter() - start, extra)
+            with run.task(task) as trace:
+                traced = TracedClient(client, "workflow")
+                start = time.perf_counter()
+                rows, final_eval, code = run_pipeline_for_task(
+                    run_id=run.run_id, task=task, client=traced, model=args.model,
+                    eval_timeout_sec=args.eval_timeout_sec, tests_preview_limit=args.tests_preview_limit,
+                )
+                extra = final_benchmark_score(task, code, final_eval)
+            run.save(task, rows, final_eval, code, traced.calls, time.perf_counter() - start, extra, trace)
 
 
 if __name__ == "__main__":

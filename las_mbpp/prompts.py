@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Dict, List
 
+from las_mbpp.telemetry import observe
+
 
 CODING_SYSTEM_PROMPT = (
     "You are a precise Python coding assistant.\n"
@@ -26,6 +28,7 @@ def format_tests_for_prompt(tests: List[str], limit: int = 5) -> str:
     return "\n".join(lines)
 
 
+@observe("prompt.debate_initial", "processing")
 def build_debate_initial_prompt(
     *,
     task_description: str,
@@ -52,6 +55,7 @@ def build_debate_initial_prompt(
     )
 
 
+@observe("prompt.debate_revision", "processing")
 def build_debate_revision_prompt(
     *,
     task_description: str,
@@ -87,6 +91,7 @@ def build_debate_revision_prompt(
     )
 
 
+@observe("prompt.consensus", "processing")
 def build_consensus_prompt(
     *,
     task_description: str,
@@ -118,6 +123,7 @@ def build_consensus_prompt(
     )
 
 
+@observe("prompt.reflection", "processing")
 def build_reflection_prompt(
     *,
     task_description: str,
@@ -136,6 +142,7 @@ def build_reflection_prompt(
     )
 
 
+@observe("prompt.verification", "processing")
 def build_verification_prompt(
     *,
     task_description: str,
@@ -163,6 +170,7 @@ def build_verification_prompt(
     )
 
 
+@observe("prompt.error_correction", "processing")
 def build_error_correction_prompt(
     *,
     task_description: str,

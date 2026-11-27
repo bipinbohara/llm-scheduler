@@ -30,6 +30,7 @@ from las_mbpp.checkpoints import checkpoint_identity
 from las_mbpp.benchmarks import add_dataset_argument, evaluate_plus_suite, final_benchmark_score, load_tasks, sanitized_mbpp_records
 from las_mbpp.evaluation import run_native_evaluation
 from las_mbpp.local_models import LocalChatClient, get_local_model, positive_int
+from las_mbpp.telemetry import HTTP_HOOKS, event, model_node, observe, span, submit
 from las_mbpp.run_artifacts import RunArtifacts, TracedClient, add_run_arguments, public_url, url_secrets
 from las_mbpp.prompts import (  # noqa: E402
     CODING_SYSTEM_PROMPT,
@@ -238,6 +239,7 @@ def validate_with_jsonschema(data: Dict[str, Any]) -> bool:
         return False
 
 
+@observe("router.spec_adherence", "routing")
 def compute_spec_adherence_score(
     *,
     row: Dict[str, Any],
@@ -306,6 +308,7 @@ def jaccard_similarity(a: set[str], b: set[str]) -> float:
     return float(len(a & b) / len(union))
 
 
+@observe("router.local_agreement", "routing")
 def compute_local_agreement_for_codes(codes: Sequence[str]) -> float:
     if len(codes) < 2:
         return 1.0
@@ -362,6 +365,7 @@ class GateEvaluation:
     las_output_tokens: int
     las_total_tokens: int
     las_api_error: str
+    las_call_id: str | None = None
 
 
 @dataclass
@@ -437,6 +441,7 @@ class DistilBertPassrateScorer:
         self._max_length = int(max_length)
         self._lock = threading.Lock()
 
+    @observe("router.distilbert", "routing")
     def score(self, code_text: str) -> Tuple[float, int, float]:
         text = code_text or ""
         t0 = time.perf_counter()
@@ -567,6 +572,7 @@ def _parse_las_action(raw_text: str) -> Tuple[str, str, str]:
     return action, reason, parse_error
 
 
+@observe("router.forward", "routing")
 def evaluate_gate_and_las(
     *,
     task: Dict[str, Any],
@@ -666,7 +672,8 @@ def evaluate_gate_and_las(
             tests_total=tests_total,
             code_snippet=code_text,
         )
-        las_response = las_client.call(
+        las_response = model_node(
+            las_client, "router_decision", "las_router",
             system_prompt=LAS_ROUTER_SYSTEM_PROMPT,
             user_prompt=las_prompt,
             model=las_model,
@@ -682,6 +689,10 @@ def evaluate_gate_and_las(
         if las_api_error and not las_parse_error:
             las_parse_error = f"LAS API error on backend={las_llm_api}: {las_api_error}"
 
+    event("router_decision", stage_index=stage_index, stage=stage_name, source_agent=agent_name,
+          score=gate_score, threshold=gate_config.threshold, gate_decision=gate_decision,
+          action=las_action or None, error=las_parse_error or las_api_error or None,
+          call_id=las_response.get("_trace_call_id") if las_called else None)
     return GateEvaluation(
         distilbert_score=float(dist_score),
         spec_adherence_score=float(spec_score),
@@ -707,6 +718,7 @@ def evaluate_gate_and_las(
         las_output_tokens=int(las_output_tokens),
         las_total_tokens=int(las_total_tokens),
         las_api_error=las_api_error,
+        las_call_id=las_response.get("_trace_call_id") if las_called else None,
     )
 
 
@@ -751,6 +763,7 @@ def build_prompt_stub(description: str, reference_code: str, function_name: str)
     return f'{sig_line}\n    """{desc}"""\n    pass\n'
 
 
+@observe("grader.extract_code", "processing")
 def strip_to_code(raw: str, expected_name: Optional[str] = None) -> str:
     text = (raw or "").strip()
     code = text
@@ -882,7 +895,11 @@ def _evaluate_code_worker(code: str, setup_code: str, tests: List[str]) -> Dict[
     }
 
 
-def evaluate_code(task: Dict[str, Any], raw_completion: str, timeout_sec: float = DEFAULT_EVAL_TIMEOUT) -> Dict[str, Any]:
+@observe("grader.evaluate_candidate", "grading")
+def evaluate_code(
+    task: Dict[str, Any], raw_completion: str, timeout_sec: float = DEFAULT_EVAL_TIMEOUT,
+    *, source_call_id: str | None = None, stage: str | None = None,
+) -> Dict[str, Any]:
     expected_name = task.get("function_name")
     code = strip_to_code(raw_completion, expected_name=expected_name)
     if "evalplus" in task:
@@ -916,6 +933,11 @@ def evaluate_code(task: Dict[str, Any], raw_completion: str, timeout_sec: float 
     result["code"] = code
     result["eval_latency_sec"] = time.perf_counter() - t0
     return result
+
+
+@observe("testing", "node", agent="testing_stage")
+def evaluate_test_node(*args, **kwargs):
+    return evaluate_code(*args, **kwargs)
 
 
 def build_test_feedback(eval_result: Dict[str, Any], max_failures: int = 5) -> str:
@@ -989,7 +1011,7 @@ class AnthropicChatClient:
             kwargs["api_key"] = api_key
         if base_url:
             kwargs["base_url"] = base_url
-        self.client = anthropic.Anthropic(**kwargs)
+        self.client = anthropic.Anthropic(http_client=anthropic.DefaultHttpxClient(event_hooks=HTTP_HOOKS), **kwargs)
         self.max_tokens = int(max_tokens)
         self.temperature = float(temperature)
 
@@ -999,7 +1021,7 @@ class AnthropicChatClient:
             message = self.client.messages.create(
                 model=model,
                 max_tokens=self.max_tokens,
-                temperature=self.temperature,
+                extra_body={"temperature": self.temperature},
                 system=system_prompt,
                 messages=[
                     {
@@ -1025,6 +1047,10 @@ class AnthropicChatClient:
                 else:
                     input_tokens = int(getattr(usage_obj, "input_tokens", 0) or 0)
                     output_tokens = int(getattr(usage_obj, "output_tokens", 0) or 0)
+            provider_usage = None
+            if usage_obj is not None:
+                provider_usage = {"input_tokens": input_tokens, "output_tokens": output_tokens,
+                                  "total_tokens": input_tokens + output_tokens}
             if input_tokens == 0:
                 input_tokens = _estimate_tokens(system_prompt) + _estimate_tokens(user_prompt)
             if output_tokens == 0:
@@ -1035,6 +1061,8 @@ class AnthropicChatClient:
                 "error": "",
                 "output_text": output_text,
                 "finish_reason": getattr(message, "stop_reason", None),
+                "provider_usage": provider_usage, "response_id": getattr(message, "id", None),
+                "reported_model": getattr(message, "model", None),
                 "usage": {
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
@@ -1060,6 +1088,9 @@ class AnthropicChatClient:
 
 
 class ArkChatClient:
+    # The existing Ark request delegates sampling and output limits to the provider.
+    generation_parameters = {"max_tokens": None, "temperature": None}
+
     def __init__(
         self,
         *,
@@ -1070,12 +1101,14 @@ class ArkChatClient:
     ) -> None:
         try:
             from volcenginesdkarkruntime import Ark
+            from volcenginesdkarkruntime._base_client import DefaultHttpxClient
         except ImportError as exc:  # pragma: no cover - import guard
             raise RuntimeError(
                 "volcenginesdkarkruntime package is required for --llm_api ark. "
                 "Install with: pip install volcenginesdkarkruntime"
             ) from exc
-        self.client = Ark(base_url=base_url, api_key=api_key)
+        self.client = Ark(base_url=base_url, api_key=api_key,
+                          http_client=DefaultHttpxClient(event_hooks=HTTP_HOOKS))
         self.max_tokens = int(max_tokens)
         self.temperature = float(temperature)
 
@@ -1155,6 +1188,10 @@ class ArkChatClient:
             latency = time.perf_counter() - t0
             output_text = self._extract_text(response)
             input_tokens, output_tokens = self._extract_usage(response)
+            provider_usage = None
+            if getattr(response, "usage", None) is not None:
+                provider_usage = {"input_tokens": input_tokens, "output_tokens": output_tokens,
+                                  "total_tokens": input_tokens + output_tokens}
             if input_tokens == 0:
                 input_tokens = _estimate_tokens(input_text)
             if output_tokens == 0:
@@ -1165,6 +1202,8 @@ class ArkChatClient:
                 "error": "",
                 "output_text": output_text,
                 "finish_reason": getattr(response, "status", None),
+                "provider_usage": provider_usage, "response_id": getattr(response, "id", None),
+                "reported_model": getattr(response, "model", None),
                 "usage": {
                     "input_tokens": input_tokens,
                     "output_tokens": output_tokens,
@@ -1192,14 +1231,15 @@ class ArkChatClient:
 def _parallel_calls(
     client: LLMClient,
     requests: Dict[str, Dict[str, str]],
+    stage: str,
 ) -> Dict[str, Dict[str, Any]]:
     results: Dict[str, Dict[str, Any]] = {}
     if not requests:
         return results
     with ThreadPoolExecutor(max_workers=len(requests)) as pool:
         future_to_agent = {
-            pool.submit(
-                client.call,
+            submit(
+                pool, model_node, client, stage, f"debate_agent_{agent}",
                 system_prompt=req["system_prompt"],
                 user_prompt=req["user_prompt"],
                 model=req["model"],
@@ -1263,6 +1303,7 @@ def create_llm_client(
     raise ValueError(f"Unsupported llm_api backend: {llm_api}")
 
 
+@observe("graph.select_consensus", "processing")
 def _parse_consensus_choice(raw_text: str, valid_agents: List[str]) -> Tuple[Optional[str], str]:
     data = _extract_json_dict(raw_text)
     reason = ""
@@ -1313,9 +1354,13 @@ def _make_stage_row(
     latency_sec: float,
     api_error: str,
     eval_result: Dict[str, Any],
+    workflow_call_id: str | None = None,
     selected_agent: str = "",
     selected_reason: str = "",
 ) -> Dict[str, Any]:
+    event("stage_result", stage_index=stage_index, stage=stage_name, agent=agent_name, call_id=workflow_call_id,
+          status=eval_result.get("exec_status"), passed=eval_result.get("passed_all"),
+          error=api_error or eval_result.get("exec_error"))
     return {
         "run_id": run_id,
         "timestamp_utc": _utc_now_iso(),
@@ -1325,6 +1370,7 @@ def _make_stage_row(
         "stage_index": stage_index,
         "stage_name": stage_name,
         "agent_name": agent_name,
+        "workflow_call_id": workflow_call_id,
         "model": model_name,
         "system_prompt": system_prompt,
         "agent_input": input_prompt,
@@ -1415,6 +1461,7 @@ def _apply_gate_logs_to_row(
     row["gate_distilbert_latency_sec"] = float(gate_eval.gate_distilbert_latency_sec)
     row["gate_unit_latency_sec"] = float(gate_eval.gate_latency_sec)
     row["las_called"] = bool(gate_eval.las_called)
+    row["router_call_id"] = gate_eval.las_call_id
     row["las_llm_api"] = las_llm_api if gate_eval.las_called else ""
     row["las_model"] = las_model if gate_eval.las_called else ""
     row["las_prompt"] = gate_eval.las_prompt
@@ -1468,7 +1515,8 @@ def _append_testing_and_error_correction(
     route_action: str,
     route_source_stage: str,
 ) -> Tuple[int, Dict[str, Any], str]:
-    testing_eval = evaluate_code(task, base_code, timeout_sec=eval_timeout_sec)
+    testing_eval = evaluate_test_node(task, base_code, timeout_sec=eval_timeout_sec,
+                                      stage="testing")
     testing_output = _safe_json_dumps(
         {
             "exec_status": testing_eval.get("exec_status", ""),
@@ -1513,12 +1561,14 @@ def _append_testing_and_error_correction(
         tests=task["tests"],
         tests_preview_limit=tests_preview_limit,
     )
-    correction_res = client.call(
+    correction_res = model_node(
+        client, "error_correction", "error_correction_agent",
         system_prompt=CODING_SYSTEM_PROMPT,
         user_prompt=correction_prompt,
         model=model,
     )
-    correction_eval = evaluate_code(task, correction_res["output_text"], timeout_sec=eval_timeout_sec)
+    correction_eval = evaluate_code(task, correction_res["output_text"], timeout_sec=eval_timeout_sec,
+                                 source_call_id=correction_res.get("_trace_call_id"), stage="error_correction")
     final_code = correction_eval["code"]
     stage_index += 1
     rows.append(
@@ -1532,6 +1582,7 @@ def _append_testing_and_error_correction(
             system_prompt=CODING_SYSTEM_PROMPT,
             input_prompt=correction_prompt,
             output_text=correction_res["output_text"],
+            workflow_call_id=correction_res.get("_trace_call_id"),
             output_code=final_code,
             input_tokens=correction_res["usage"]["input_tokens"],
             output_tokens=correction_res["usage"]["output_tokens"],
@@ -1548,6 +1599,7 @@ def _append_testing_and_error_correction(
     return stage_index, correction_eval, final_code
 
 
+@observe("final_output_unit", "node", agent="final_output_unit")
 def _append_early_exit_stage(
     *,
     rows: List[Dict[str, Any]],
@@ -1557,6 +1609,9 @@ def _append_early_exit_stage(
     route: RouteDecision,
 ) -> Tuple[int, Dict[str, Any], str]:
     stage_index += 1
+    event("reuse_validated_answer", stage="final_output_unit", source_agent=route.source_agent,
+          source_stage=route.source_stage, tests_passed=route.eval_result["pass_count"],
+          tests_total=route.eval_result["total_count"])
     route_output = _safe_json_dumps(
         {
             "action": route.action,
@@ -1593,6 +1648,7 @@ def _append_early_exit_stage(
     return stage_index, route.eval_result, route.code
 
 
+@observe("graph.execute", "graph")
 def run_pipeline_for_task(
     *,
     run_id: str,
@@ -1658,6 +1714,7 @@ def run_pipeline_for_task(
 
     initial_outputs: Dict[str, Dict[str, Any]] = {}
     generated_initial_agents: List[str] = []
+    event("round", round_index=1, agents=[f"debate_agent_{agent}" for agent in debate_agents], edges=[])
     for agent in debate_agents:
         prompt = build_debate_initial_prompt(
             task_description=task["description"],
@@ -1669,12 +1726,14 @@ def run_pipeline_for_task(
             include_official_test_examples=include_test_examples_in_previous_prompts,
             benchmark_name=task.get("benchmark_name", "MBPP"),
         )
-        llm_res = client.call(
+        llm_res = model_node(
+            client, "debate_initial", f"debate_agent_{agent}",
             system_prompt=CODING_SYSTEM_PROMPT,
             user_prompt=prompt,
             model=model,
         )
-        eval_res = evaluate_code(task, llm_res["output_text"], timeout_sec=eval_timeout_sec)
+        eval_res = evaluate_code(task, llm_res["output_text"], timeout_sec=eval_timeout_sec,
+                                 source_call_id=llm_res.get("_trace_call_id"), stage="debate")
         initial_outputs[agent] = {
             "code": eval_res["code"],
             "eval": eval_res,
@@ -1693,6 +1752,7 @@ def run_pipeline_for_task(
             system_prompt=CODING_SYSTEM_PROMPT,
             input_prompt=prompt,
             output_text=llm_res["output_text"],
+            workflow_call_id=llm_res.get("_trace_call_id"),
             output_code=eval_res["code"],
             input_tokens=llm_res["usage"]["input_tokens"],
             output_tokens=llm_res["usage"]["output_tokens"],
@@ -1768,11 +1828,15 @@ def run_pipeline_for_task(
             "model": model,
         }
 
-    final_debate_results = _parallel_calls(client, final_debate_requests)
+    event("round", round_index=2, agents=[f"debate_agent_{agent}" for agent in debate_agents],
+          edges=[{"from": f"debate_agent_{peer}", "to": f"debate_agent_{agent}", "from_round": 1, "to_round": 2}
+                 for agent in debate_agents for peer in debate_agents])
+    final_debate_results = _parallel_calls(client, final_debate_requests, "debate_final")
     final_outputs: Dict[str, Dict[str, Any]] = {}
     for agent in debate_agents:
         llm_res = final_debate_results[agent]
-        eval_res = evaluate_code(task, llm_res["output_text"], timeout_sec=eval_timeout_sec)
+        eval_res = evaluate_code(task, llm_res["output_text"], timeout_sec=eval_timeout_sec,
+                                 source_call_id=llm_res.get("_trace_call_id"), stage="debate")
         final_outputs[agent] = {
             "code": eval_res["code"],
             "eval": eval_res,
@@ -1791,6 +1855,7 @@ def run_pipeline_for_task(
                 system_prompt=CODING_SYSTEM_PROMPT,
                 input_prompt=final_debate_requests[agent]["user_prompt"],
                 output_text=llm_res["output_text"],
+                workflow_call_id=llm_res.get("_trace_call_id"),
                 output_code=eval_res["code"],
                 input_tokens=llm_res["usage"]["input_tokens"],
                 output_tokens=llm_res["usage"]["output_tokens"],
@@ -1856,7 +1921,8 @@ def run_pipeline_for_task(
         tests_preview_limit=tests_preview_limit,
         include_official_test_examples=include_test_examples_in_previous_prompts,
     )
-    consensus_res = client.call(
+    consensus_res = model_node(
+        client, "consensus", "consensus_agent",
         system_prompt=CONSENSUS_SYSTEM_PROMPT,
         user_prompt=consensus_prompt,
         model=model,
@@ -1876,6 +1942,9 @@ def run_pipeline_for_task(
 
     selected_code = final_outputs[selected_agent]["code"]
     selected_eval = final_outputs[selected_agent]["eval"]
+    event("reuse_validated_answer", stage="consensus", source_agent=f"debate_agent_{selected_agent}",
+          source_call_id=final_outputs[selected_agent]["llm"].get("_trace_call_id"),
+          tests_passed=selected_eval["pass_count"], tests_total=selected_eval["total_count"])
     stage_index += 1
     rows.append(
         _make_stage_row(
@@ -1888,6 +1957,7 @@ def run_pipeline_for_task(
             system_prompt=CONSENSUS_SYSTEM_PROMPT,
             input_prompt=consensus_prompt,
             output_text=consensus_res["output_text"],
+            workflow_call_id=consensus_res.get("_trace_call_id"),
             output_code=selected_code,
             input_tokens=consensus_res["usage"]["input_tokens"],
             output_tokens=consensus_res["usage"]["output_tokens"],
@@ -1946,12 +2016,14 @@ def run_pipeline_for_task(
         function_name_from_tests=task["function_name"],
         selected_code=selected_code,
     )
-    reflection_res = client.call(
+    reflection_res = model_node(
+        client, "reflection", "reflection_agent",
         system_prompt=CODING_SYSTEM_PROMPT,
         user_prompt=reflection_prompt,
         model=model,
     )
-    reflection_eval = evaluate_code(task, reflection_res["output_text"], timeout_sec=eval_timeout_sec)
+    reflection_eval = evaluate_code(task, reflection_res["output_text"], timeout_sec=eval_timeout_sec,
+                                 source_call_id=reflection_res.get("_trace_call_id"), stage="reflection")
     reflected_code = reflection_eval["code"]
     stage_index += 1
     rows.append(
@@ -1965,6 +2037,7 @@ def run_pipeline_for_task(
             system_prompt=CODING_SYSTEM_PROMPT,
             input_prompt=reflection_prompt,
             output_text=reflection_res["output_text"],
+            workflow_call_id=reflection_res.get("_trace_call_id"),
             output_code=reflected_code,
             input_tokens=reflection_res["usage"]["input_tokens"],
             output_tokens=reflection_res["usage"]["output_tokens"],
@@ -2024,12 +2097,14 @@ def run_pipeline_for_task(
         tests_preview_limit=tests_preview_limit,
         include_official_test_examples=include_test_examples_in_previous_prompts,
     )
-    verification_res = client.call(
+    verification_res = model_node(
+        client, "verification", "verification_agent",
         system_prompt=CODING_SYSTEM_PROMPT,
         user_prompt=verification_prompt,
         model=model,
     )
-    verification_eval = evaluate_code(task, verification_res["output_text"], timeout_sec=eval_timeout_sec)
+    verification_eval = evaluate_code(task, verification_res["output_text"], timeout_sec=eval_timeout_sec,
+                                 source_call_id=verification_res.get("_trace_call_id"), stage="verification")
     verified_code = verification_eval["code"]
     stage_index += 1
     rows.append(
@@ -2043,6 +2118,7 @@ def run_pipeline_for_task(
             system_prompt=CODING_SYSTEM_PROMPT,
             input_prompt=verification_prompt,
             output_text=verification_res["output_text"],
+            workflow_call_id=verification_res.get("_trace_call_id"),
             output_code=verified_code,
             input_tokens=verification_res["usage"]["input_tokens"],
             output_tokens=verification_res["usage"]["output_tokens"],
@@ -2160,7 +2236,7 @@ def _parse_task_ids(raw: Optional[str]) -> Optional[set[int]]:
 
 def _run_task_pipeline_job(
     *,
-    run_id: str,
+    run: RunArtifacts,
     task: Dict[str, Any],
     worker_factory: Callable[[], LLMClient],
     model: str,
@@ -2174,35 +2250,36 @@ def _run_task_pipeline_job(
     tests_preview_limit: int,
     include_test_examples_in_previous_prompts: bool,
 ):
-    traced = TracedClient(worker_factory(), "workflow")
-    traced_router = TracedClient(router_factory(), "router")
-    start = time.perf_counter()
-    try:
-        rows, final_eval, code = run_pipeline_for_task(
-            run_id=run_id, task=task, client=traced, model=model, las_client=traced_router,
-            las_model=las_model, las_llm_api=las_llm_api, gate_scorer=gate_scorer,
-            gate_config=gate_config, history_tracker=history_tracker,
-            eval_timeout_sec=eval_timeout_sec, tests_preview_limit=tests_preview_limit,
-            include_test_examples_in_previous_prompts=include_test_examples_in_previous_prompts,
-        )
-        extra = final_benchmark_score(task, code, final_eval)
-    except Exception as exc:  # retain the native runner's per-task failure behavior
-        final_eval = {
-            "pass_count": 0,
-            "total_count": len(task.get("evaluation_tests", task["tests"])),
-            "passed_all": False,
-            "exec_status": "Pipeline execution error.",
-            "exec_error": f"{type(exc).__name__}: {exc}",
-            "failures": [], "feedback_text": "Pipeline execution error.", "eval_latency_sec": 0.0,
-        }
-        rows = [_make_stage_row(
-            run_id=run_id, task=task, stage_index=1, stage_name="pipeline_error",
-            agent_name="pipeline_runner", model_name=model, system_prompt="", input_prompt="",
-            output_text="", output_code="", input_tokens=0, output_tokens=0, total_tokens=0,
-            latency_sec=0.0, api_error=final_eval["exec_error"], eval_result=final_eval,
-        )]
-        code, extra = "", {}
-    return rows, final_eval, code, traced.calls + traced_router.calls, time.perf_counter() - start, extra
+    with run.task(task) as trace:
+        traced = TracedClient(worker_factory(), "workflow")
+        traced_router = TracedClient(router_factory(), "router")
+        start = time.perf_counter()
+        try:
+            rows, final_eval, code = run_pipeline_for_task(
+                run_id=run.run_id, task=task, client=traced, model=model, las_client=traced_router,
+                las_model=las_model, las_llm_api=las_llm_api, gate_scorer=gate_scorer,
+                gate_config=gate_config, history_tracker=history_tracker,
+                eval_timeout_sec=eval_timeout_sec, tests_preview_limit=tests_preview_limit,
+                include_test_examples_in_previous_prompts=include_test_examples_in_previous_prompts,
+            )
+            extra = final_benchmark_score(task, code, final_eval)
+        except Exception as exc:  # retain the native runner's per-task failure behavior
+            final_eval = {
+                "pass_count": 0,
+                "total_count": len(task.get("evaluation_tests", task["tests"])),
+                "passed_all": False,
+                "exec_status": "Pipeline execution error.",
+                "exec_error": f"{type(exc).__name__}: {exc}",
+                "failures": [], "feedback_text": "Pipeline execution error.", "eval_latency_sec": 0.0,
+            }
+            rows = [_make_stage_row(
+                run_id=run.run_id, task=task, stage_index=1, stage_name="pipeline_error",
+                agent_name="pipeline_runner", model_name=model, system_prompt="", input_prompt="",
+                output_text="", output_code="", input_tokens=0, output_tokens=0, total_tokens=0,
+                latency_sec=0.0, api_error=final_eval["exec_error"], eval_result=final_eval,
+            )]
+            code, extra = "", {}
+    return rows, final_eval, code, traced.calls + traced_router.calls, time.perf_counter() - start, extra, trace
 
 
 def parse_args() -> argparse.Namespace:
@@ -2397,80 +2474,6 @@ def main() -> None:
     las_ark_api_key = args.las_ark_api_key or ark_api_key
     las_ark_base_url = args.las_ark_base_url or os.environ.get("LAS_ARK_BASE_URL") or ark_base_url
 
-    if args.llm_api == "local":
-        get_local_model(args.model).endpoint()
-    if las_llm_api == "local":
-        get_local_model(las_model).endpoint()
-
-    gate_config = GateConfig(
-        weight_distillbert=float(args.weight_distillbert),
-        weight_local_agreement=float(args.weight_local_agreement),
-        weight_adhere=float(args.weight_adhere),
-        weight_history=float(args.weight_history),
-        threshold=float(args.gate_threshold),
-    )
-
-    worker_factory = partial(
-        create_llm_client,
-        llm_api=args.llm_api,
-        max_tokens=args.max_tokens,
-        temperature=args.temperature,
-        anthropic_api_key=anthropic_api_key,
-        anthropic_base_url=anthropic_base_url,
-        ark_api_key=ark_api_key,
-        ark_base_url=ark_base_url,
-    )
-    router_factory = partial(
-        create_llm_client,
-        llm_api=las_llm_api,
-        max_tokens=las_max_tokens,
-        temperature=las_temperature,
-        anthropic_api_key=las_anthropic_api_key,
-        anthropic_base_url=las_anthropic_base_url,
-        ark_api_key=las_ark_api_key,
-        ark_base_url=las_ark_base_url,
-    )
-    worker_factory()
-    router_factory()
-    gate_scorer = get_or_create_gate_scorer(
-        model_name=args.gate_model_name,
-        checkpoint_path=None if args.untrained_gate else args.gate_checkpoint_path,
-        max_length=args.gate_max_length,
-        seed=args.gate_seed,
-    )
-    tasks_by_split = [
-        load_tasks(args.dataset, split, limit=args.limit_per_split, task_ids=task_ids,
-                   native_loader=load_mbpp_sanitized_tasks)
-        for split in splits
-    ]
-    tasks = [task for split_tasks in tasks_by_split for task in split_tasks]
-    if not tasks:
-        raise ValueError("No tasks matched. Check --splits, --task_ids and --limit_per_split.")
-
-    checkpoint = dict(gate_scorer.checkpoint)
-    if not args.untrained_gate:
-        checkpoint["path"] = str(args.gate_checkpoint_path.resolve())
-    settings = {
-        "workflow": "las_distilbert", "dataset": args.dataset, "splits": splits,
-        "limit_per_split": args.limit_per_split, "task_ids": sorted(task_ids) if task_ids else None,
-        "model": args.model, "llm_api": args.llm_api, "max_tokens": args.max_tokens,
-        "temperature": args.temperature, "las_llm_api": las_llm_api, "las_model": las_model,
-        "las_max_tokens": las_max_tokens, "las_temperature": las_temperature,
-        "task_concurrency": args.task_concurrency, "eval_timeout_sec": args.eval_timeout_sec,
-        "include_test_examples_in_previous_prompts": args.include_test_examples_in_previous_prompts,
-        "tests_preview_limit": args.tests_preview_limit, "checkpoint": checkpoint,
-        "gate_checkpoint_path": checkpoint.get("path"),
-        "gate_model_name": args.gate_model_name, "gate_max_length": args.gate_max_length,
-        "weight_distillbert": gate_config.weight_distillbert,
-        "weight_local_agreement": gate_config.weight_local_agreement,
-        "weight_adhere": gate_config.weight_adhere, "weight_history": gate_config.weight_history,
-        "gate_threshold": gate_config.threshold, "excel": args.excel,
-        "anthropic_base_url": public_url(anthropic_base_url), "ark_base_url": public_url(ark_base_url),
-        "las_anthropic_base_url": public_url(las_anthropic_base_url),
-        "las_ark_base_url": public_url(las_ark_base_url),
-        "local_base_url": get_local_model(args.model).endpoint() if args.llm_api == "local" else "",
-        "las_local_base_url": get_local_model(las_model).endpoint() if las_llm_api == "local" else "",
-    }
     secrets = [anthropic_api_key, ark_api_key, las_anthropic_api_key, las_ark_api_key]
     secrets.extend(url_secrets(anthropic_base_url, ark_base_url, las_anthropic_base_url, las_ark_base_url))
     if args.llm_api == "local":
@@ -2478,8 +2481,91 @@ def main() -> None:
     if las_llm_api == "local":
         secrets.append(get_local_model(las_model).key())
 
-    history_tracker = AgentHistoryTracker()
-    with RunArtifacts(args, settings, tasks, secrets) as run:
+    with RunArtifacts(args, secrets) as run:
+        if args.llm_api == "local":
+            get_local_model(args.model).endpoint()
+        if las_llm_api == "local":
+            get_local_model(las_model).endpoint()
+
+        gate_config = GateConfig(
+            weight_distillbert=float(args.weight_distillbert),
+            weight_local_agreement=float(args.weight_local_agreement),
+            weight_adhere=float(args.weight_adhere),
+            weight_history=float(args.weight_history),
+            threshold=float(args.gate_threshold),
+        )
+
+        worker_factory = partial(
+            create_llm_client,
+            llm_api=args.llm_api,
+            max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            anthropic_api_key=anthropic_api_key,
+            anthropic_base_url=anthropic_base_url,
+            ark_api_key=ark_api_key,
+            ark_base_url=ark_base_url,
+        )
+        router_factory = partial(
+            create_llm_client,
+            llm_api=las_llm_api,
+            max_tokens=las_max_tokens,
+            temperature=las_temperature,
+            anthropic_api_key=las_anthropic_api_key,
+            anthropic_base_url=las_anthropic_base_url,
+            ark_api_key=las_ark_api_key,
+            ark_base_url=las_ark_base_url,
+        )
+        run.log("Initializing generation providers and LAS gate")
+        worker_factory()
+        router_factory()
+        gate_scorer = get_or_create_gate_scorer(
+            model_name=args.gate_model_name,
+            checkpoint_path=None if args.untrained_gate else args.gate_checkpoint_path,
+            max_length=args.gate_max_length,
+            seed=args.gate_seed,
+        )
+        run.log("Loading evaluation dataset")
+        tasks_by_split = [
+            load_tasks(args.dataset, split, limit=args.limit_per_split, task_ids=task_ids,
+                       native_loader=load_mbpp_sanitized_tasks)
+            for split in splits
+        ]
+        tasks = [task for split_tasks in tasks_by_split for task in split_tasks]
+        if not tasks:
+            raise ValueError("No tasks matched. Check --splits, --task_ids and --limit_per_split.")
+
+        checkpoint = dict(gate_scorer.checkpoint)
+        if not args.untrained_gate:
+            checkpoint["path"] = str(args.gate_checkpoint_path.resolve())
+        settings = {
+            "workflow": "las_distilbert", "dataset": args.dataset, "splits": splits,
+            "limit_per_split": args.limit_per_split, "task_ids": sorted(task_ids) if task_ids else None,
+            "model": args.model, "llm_api": args.llm_api, "max_tokens": args.max_tokens,
+            "temperature": args.temperature, "las_llm_api": las_llm_api, "las_model": las_model,
+            "las_max_tokens": las_max_tokens, "las_temperature": las_temperature,
+            "task_concurrency": args.task_concurrency, "eval_timeout_sec": args.eval_timeout_sec,
+            "include_test_examples_in_previous_prompts": args.include_test_examples_in_previous_prompts,
+            "tests_preview_limit": args.tests_preview_limit, "checkpoint": checkpoint,
+            "gate_checkpoint_path": checkpoint.get("path"),
+            "gate_model_name": args.gate_model_name, "gate_max_length": args.gate_max_length,
+            "weight_distillbert": gate_config.weight_distillbert,
+            "weight_local_agreement": gate_config.weight_local_agreement,
+            "weight_adhere": gate_config.weight_adhere, "weight_history": gate_config.weight_history,
+            "gate_threshold": gate_config.threshold, "excel": args.excel,
+            "anthropic_base_url": public_url(anthropic_base_url), "ark_base_url": public_url(ark_base_url),
+            "las_anthropic_base_url": public_url(las_anthropic_base_url),
+            "las_ark_base_url": public_url(las_ark_base_url),
+            "local_base_url": get_local_model(args.model).endpoint() if args.llm_api == "local" else "",
+            "las_local_base_url": get_local_model(las_model).endpoint() if las_llm_api == "local" else "",
+        }
+
+        history_tracker = AgentHistoryTracker()
+        run.device = str(gate_scorer._device)
+        run.configure(settings, tasks)
+        run.save_router(
+            lambda path: torch.save(gate_scorer._model.state_dict(), path),
+            lambda path: gate_scorer._model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True), strict=True),
+        )
         for record in run.records.values():
             for row in record["stages"]:
                 if row.get("gate_decision"):
@@ -2489,7 +2575,7 @@ def main() -> None:
                 future_map = {
                     pool.submit(
                         _run_task_pipeline_job,
-                        run_id=run.run_id, task=task, worker_factory=worker_factory, model=args.model,
+                        run=run, task=task, worker_factory=worker_factory, model=args.model,
                         router_factory=router_factory, las_model=las_model, las_llm_api=las_llm_api,
                         gate_scorer=gate_scorer, gate_config=gate_config, history_tracker=history_tracker,
                         eval_timeout_sec=args.eval_timeout_sec, tests_preview_limit=args.tests_preview_limit,
@@ -2497,8 +2583,8 @@ def main() -> None:
                     ): task for task in split_tasks if not run.completed(task)
                 }
                 for future in as_completed(future_map):
-                    rows, final_eval, code, calls, elapsed, extra = future.result()
-                    run.save(future_map[future], rows, final_eval, code, calls, elapsed, extra)
+                    rows, final_eval, code, calls, elapsed, extra, trace = future.result()
+                    run.save(future_map[future], rows, final_eval, code, calls, elapsed, extra, trace)
 
 
 if __name__ == "__main__":

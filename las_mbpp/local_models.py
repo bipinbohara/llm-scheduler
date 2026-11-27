@@ -8,6 +8,8 @@ import time
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from las_mbpp.telemetry import HTTP_HOOKS
+
 
 @dataclass(frozen=True)
 class LocalModel:
@@ -82,25 +84,38 @@ class LocalChatClient:
         counts = {}
         text = ""
         error = ""
+        payload = {}
+        reasoning_only = False
+        failure_category = None
         try:
-            response = self.httpx.post(
-                f"{spec.endpoint()}/chat/completions", json=request, headers=headers,
-                timeout=self.httpx.Timeout(300.0, connect=10.0), trust_env=False,
-            )
+            with self.httpx.Client(
+                timeout=self.httpx.Timeout(300.0, connect=10.0), trust_env=False, event_hooks=HTTP_HOOKS,
+            ) as client:
+                response = client.post(f"{spec.endpoint()}/chat/completions", json=request, headers=headers)
             status = response.status_code
             response.raise_for_status()
             payload = response.json()
             counts = payload.get("usage") or {}
             choice = payload["choices"][0]
             finish_reason = choice.get("finish_reason") or ""
-            content = choice["message"].get("content")
+            message = choice["message"]
+            content = message.get("content")
             text = content.strip() if isinstance(content, str) else ""
+            reasoning_only = not text and bool(message.get("reasoning_content") or message.get("reasoning"))
             if finish_reason in {"length", "content_filter"}:
                 error = f"Local response finish reason: {finish_reason}."
             elif not text:
                 error = "Local response contained no answer text."
-        except self.httpx.HTTPStatusError:
+        except self.httpx.HTTPStatusError as exc:
             error = f"Local endpoint returned HTTP {status}."
+            if status in {400, 413, 422}:
+                try:
+                    details = exc.response.json()
+                except ValueError:
+                    details = None
+                clue = str(details).lower()
+                if "context" in clue and ("length" in clue or "window" in clue):
+                    failure_category = "context_limit"
         except (self.httpx.RequestError, KeyError, IndexError, TypeError, ValueError, AttributeError) as exc:
             error = f"Local request or response failed ({type(exc).__name__})."
 
@@ -110,6 +125,14 @@ class LocalChatClient:
 
         input_tokens = token_count("prompt_tokens")
         output_tokens = token_count("completion_tokens")
+        provider_usage = None
+        if isinstance(counts, dict):
+            provider_usage = {
+                canonical: counts[native]
+                for canonical, native in (("input_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens"),
+                                          ("total_tokens", "total_tokens"))
+                if type(counts.get(native)) is int and counts[native] >= 0
+            } or None
         return {
             "ok": not error,
             "error": error,
@@ -124,4 +147,9 @@ class LocalChatClient:
             "http_status": status,
             "attempts": 1,
             "usage_reported": bool(counts),
+            "reasoning_only": reasoning_only,
+            "provider_usage": provider_usage,
+            "failure_category": failure_category,
+            "reported_model": payload.get("model") if isinstance(payload, dict) else None,
+            "response_id": payload.get("id") if isinstance(payload, dict) else None,
         }
