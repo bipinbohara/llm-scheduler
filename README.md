@@ -67,7 +67,7 @@ las-mbpp-las --splits test --limit_per_split 1 --gate_checkpoint_path artifacts/
 las-mbpp-baseline --splits test --limit_per_split 1
 ```
 
-Outputs are written under `results/<dataset>/<run_id>/`. Each completed task has a JSON record and stage CSV. Use `--resume <run_id>` with the original settings to continue a saved run and `--excel` to export the summary workbook.
+Outputs are written under `results/<dataset>/<run_id>/`. Each completed task has a JSON record and stage CSV. Use `--resume <run_id>` with the original settings to continue a saved run and `--export_excel` to export the analysis workbook. Live journals, the progress summary, and the Perfetto trace use the default `experiment` stem.
 
 See [architecture and command inventory](docs/architecture.md) for local inference, official dataset preparation, paired gate runs, and resume. See [result fields](docs/results.md) for metric definitions.
 

@@ -11,6 +11,8 @@ from copy import deepcopy
 from importlib.metadata import version
 from pathlib import Path
 
+from las_mbpp.telemetry import observe, span
+
 DATASETS = ("mbpp", "mbpp-plus", "humaneval", "humaneval-plus")
 PLUS_NAMES = {"mbpp-plus": "mbpp", "humaneval-plus": "humaneval"}
 
@@ -111,6 +113,7 @@ def load_tasks(dataset, split, *, limit, task_ids, native_loader):
             task["evaluation_tests"] = [problem["test"] + f"\ncheck({entry})"]
         else:
             suites = {}
+            preparation_start = time.perf_counter()
             for field in ("base", "plus"):
                 inputs = problem[f"{field}_input"]
                 expected, timings = trusted_exec(
@@ -121,11 +124,13 @@ def load_tasks(dataset, split, *, limit, task_ids, native_loader):
             task.update(
                 evalplus=PLUS_NAMES[dataset], evalplus_version=version("evalplus"),
                 suites=suites, release_hash=release_hash, atol=problem["atol"],
+                reference_preparation_seconds=time.perf_counter() - preparation_start,
             )
         tasks.append(task)
     return tasks
 
 
+@observe("grader.evalplus_suite", "grading")
 def evaluate_plus_suite(task: dict, code: str, suite: str) -> dict:
     from evalplus.eval import PASS, untrusted_check
 
@@ -141,10 +146,11 @@ def evaluate_plus_suite(task: dict, code: str, suite: str) -> dict:
     if error:
         status, outcomes = "invalid", []
     else:
-        status, outcomes = untrusted_check(
-            task["evalplus"], code, inputs, task["function_name"], expected=expected,
-            atol=task["atol"], ref_time=timings, fast_check=False,
-        )
+        with span("grader.evalplus_execute", "grading", suite=suite, inputs=len(inputs)):
+            status, outcomes = untrusted_check(
+                task["evalplus"], code, inputs, task["function_name"], expected=expected,
+                atol=task["atol"], ref_time=timings, fast_check=False,
+            )
     passed_count = sum(bool(value) for value in outcomes)
     feedback = f"Official EvalPlus {suite} suite: {status} ({passed_count}/{len(inputs)})."
     return {
@@ -160,6 +166,7 @@ def evaluate_plus_suite(task: dict, code: str, suite: str) -> dict:
     }
 
 
+@observe("evaluation.final_scoring", "grading")
 def final_benchmark_score(task: dict, code: str, base: dict) -> dict:
     if "evalplus" not in task:
         return {}

@@ -2,12 +2,15 @@
 
 from multiprocessing import Pipe, Process
 
+from las_mbpp.telemetry import observe
+
 
 def _send_result(connection, worker, code, setup, tests):
     with connection:
         connection.send(worker(code, setup, tests))
 
 
+@observe("grader.native_process", "grading")
 def run_native_evaluation(worker, code, setup, tests, timeout):
     receive, send = Pipe(duplex=False)
     process = Process(target=_send_result, args=(send, worker, code, setup, tests))

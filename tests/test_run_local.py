@@ -86,12 +86,21 @@ def test_every_local_profile_uses_its_own_endpoint_and_optional_key(monkeypatch,
         assert request["model"] == name
 
 
+def journal_rows(path):
+    return [json.loads(line) for line in path.read_text().splitlines()]
+
+
 def test_baseline_config_resumes_after_interruption(monkeypatch, tmp_path, local_endpoint):
     monkeypatch.setattr(mbpp_baseline, "load_mbpp_sanitized_tasks", fixture_tasks)
     real_pipeline = mbpp_baseline.run_pipeline_for_task
 
     def interrupt(**kwargs):
         if kwargs["task"]["task_id"] == 2:
+            config, = (tmp_path / "mbpp").glob("*/run_config.json")
+            directory = config.parent
+            assert json.loads((directory / "experiment.json").read_text())["tasks"] == []
+            assert json.loads((directory / "experiment.summary.json").read_text())["summary"]["completed_tasks"] == 1
+            assert len(journal_rows(directory / "experiment.tasks.jsonl")) == 1
             raise KeyboardInterrupt
         return real_pipeline(**kwargs)
 
@@ -100,7 +109,7 @@ def test_baseline_config_resumes_after_interruption(monkeypatch, tmp_path, local
         from openpyxl import load_workbook
     except ImportError:
         load_workbook = None
-    args = ("--output_dir", tmp_path, "--limit_per_split", 2)
+    args = ("--output_dir", tmp_path, "--limit_per_split", 2, "--export_every", 25)
     if load_workbook is not None:
         args += ("--excel",)
     with pytest.raises(KeyboardInterrupt):
@@ -116,16 +125,49 @@ def test_baseline_config_resumes_after_interruption(monkeypatch, tmp_path, local
     assert len(json.loads((run / "run_config.json").read_text())["selected_items"]) == 2
     assert "Interrupted" in (run / "run.log").read_text()
     (run / "test/task_1.csv").unlink()
+    commit_journal = run / "experiment.tasks.jsonl"
+    with commit_journal.open("ab") as stream:
+        stream.write(b'{"partial":')
+    before_resume = journal_rows(run / "experiment.events.jsonl")
+    assert any(row["event"] == "task_interrupted" for row in before_resume)
     monkeypatch.setattr(mbpp_baseline, "run_pipeline_for_task", real_pipeline)
     launch(monkeypatch, "configs/mbpp_local_baseline.yaml", *args, "--resume", run.name)
     assert first.read_bytes() == existing
     assert (run / "test/task_1.csv").exists()
     assert (run / "test/task_2.json").exists()
     assert len(local_endpoint) == 20
+    assert next(run.glob("experiment.tasks.jsonl.tail-*.bak")).read_bytes() == b'{"partial":'
+    report = json.loads((run / "experiment.json").read_text())
+    assert report["status"] == "completed"
+    assert report["summary"]["known_total_tokens"] == 100
+    assert report["summary"]["logical_calls"] == report["summary"]["http_attempts"] == 20
+    assert report["summary"]["accuracy"] == 1
+    assert [(row["task_id"], row["evaluation_index"]) for row in journal_rows(commit_journal)] == [(1, 0), (2, 1)]
+    live = journal_rows(run / "experiment.events.jsonl")
+    attempts = [row["task_attempt"] for row in live if row["event"] == "task_started" and row["task_id"] == 2]
+    assert len(set(attempts)) == 2
+    assert live[:len(before_resume)] == before_resume
+    parent_ids = {row["span_id"] for row in report["tasks"][0]["spans"]}
+    assert all(row["parent_span_id"] is None or row["parent_span_id"] in parent_ids for row in report["tasks"][0]["spans"])
+    calls = {call["call_id"]: call for call in report["tasks"][0]["calls"]}
+    assert set(calls) >= {row["attributes"]["source_call_id"] for row in report["tasks"][0]["spans"]
+                          if row["attributes"].get("source_call_id")}
+    for call in calls.values():
+        attempt, = call["http_attempts"]
+        assert attempt["attributes"]["call_id"] == call["call_id"]
+        assert attempt["parent_span_id"] == call["span_id"]
+        assert attempt["inclusive_seconds"] >= attempt["exclusive_seconds"]
+    assert json.loads((run / "experiment.trace.json").read_text())["traceEvents"]
+    assert json.loads((run / "experiment.checkpoint.json").read_text())["last_committed_task_id"] == 2
     assert len((run / "summary.csv").read_text().splitlines()) > 2
     if load_workbook is not None:
         workbook = load_workbook(run / "summary.xlsx")
         assert workbook.active.max_row == 3
+        workbook.close()
+        workbook = load_workbook(run / "experiment.xlsx", read_only=True)
+        assert workbook["tasks"].max_row == 3
+        assert workbook["http_attempts_1"].max_row == 21
+        assert "latency_metrics" in workbook.sheetnames
         workbook.close()
     with pytest.raises(ValueError, match="settings differ"):
         launch(monkeypatch, "configs/mbpp_local_baseline.yaml", *args, "--resume", run.name, "--max_tokens", 77)
@@ -162,6 +204,18 @@ def test_las_config_uses_separate_router_and_strict_checkpoint(monkeypatch, tmp_
     assert result["summary"]["final_route_action"] == "early_exit"
     assert {req["model"]: req["max_tokens"] for _, _, req in local_endpoint} == {MODEL: 100, ROUTER: 20}
     assert any(call["attribution"] == "routing" for call in result["calls"])
+    assert any(row["event"] == "router_decision" and row["action"] == "early_exit" and row["call_id"]
+               for row in result["events"])
+    router_file = run / "experiment.router.pth"
+    cursor = json.loads((run / "experiment.checkpoint.json").read_text())
+    assert checkpoint_identity(router_file, 0)["sha256"] == cursor["router_snapshot"]["sha256"]
+    original_calls = len(local_endpoint)
+    launch(monkeypatch, "configs/mbpp_local_las.yaml", *args, "--gate_checkpoint_path", checkpoint, "--resume", run.name)
+    assert len(local_endpoint) == original_calls
+    with router_file.open("ab") as stream:
+        stream.write(b"corrupt")
+    with pytest.raises(ValueError, match="different SHA-256"):
+        launch(monkeypatch, "configs/mbpp_local_las.yaml", *args, "--gate_checkpoint_path", checkpoint, "--resume", run.name)
     control = mbpp_las_distilbert.get_or_create_gate_scorer(
         model_name=str(model_dir), checkpoint_path=None, max_length=32, seed=7,
     )
